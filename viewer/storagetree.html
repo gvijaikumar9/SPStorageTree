@@ -102,6 +102,7 @@ header.top{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-conte
 .brand h1{font-size:20px;margin:0;font-weight:650;letter-spacing:-.01em}
 .brand .meta{color:var(--text-secondary);font-size:13px;word-break:break-all}
 .actions{display:flex;gap:8px;flex-wrap:wrap}
+[hidden]{display:none !important}
 .btn{background:var(--surface-1);border:1px solid var(--border);border-radius:8px;padding:6px 12px;cursor:pointer}
 .btn:hover{background:var(--surface-2)}
 .btn.primary{background:var(--accent);color:#fff;border-color:transparent}
@@ -1036,7 +1037,9 @@ function load(input, sample){
   const bn = $("#banner");
   bn.hidden = !parts.length;
   bn.innerHTML = parts.map(p => `<div>${p}</div>`).join(`<div style="height:6px"></div>`);
+  // Sample picker only while looking at sample data; once a real report is open it would just replace it.
   $("#optSample").value = sample || "";
+  $("#optSample").hidden = !sample;
   renderAll();
 }
 

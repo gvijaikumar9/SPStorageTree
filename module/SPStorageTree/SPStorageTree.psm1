@@ -2,7 +2,7 @@
 # SharePoint Storage Tree - scanner. Read-only: it never changes anything in SharePoint.
 # Emits report schema v1.1 (see viewer/storagetree.html header for the contract).
 
-$script:GeneratorVersion = '0.1.0'
+$script:GeneratorVersion = '0.1.1'
 $script:Activity = 'SharePoint Storage Tree'
 
 function ConvertTo-SPSTInt64 {
@@ -110,9 +110,12 @@ function Get-SPSTWebScan {
         foreach ($it in $items) {
             $fv = $it.FieldValues
             if ([int]$fv.FSObjType -ne 0) { continue }
-            $size = ConvertTo-SPSTInt64 $fv.SMTotalFileStreamSize
-            if ($null -eq $size) { $size = ConvertTo-SPSTInt64 $fv.File_x0020_Size }
-            if ($null -eq $size -or $size -lt 0) { $size = 0 }
+            # Current size: the larger of the two fields. Gallery files (master pages, themes, web parts) report
+            # SMTotalFileStreamSize = 0 while File_x0020_Size has the real size (lab-verified).
+            $stream = ConvertTo-SPSTInt64 $fv.SMTotalFileStreamSize
+            $fsize = ConvertTo-SPSTInt64 $fv.File_x0020_Size
+            $size = [math]::Max([int64]$(if ($null -eq $stream) { 0 } else { $stream }), [int64]$(if ($null -eq $fsize) { 0 } else { $fsize }))
+            if ($size -lt 0) { $size = 0 }
             $total = ConvertTo-SPSTInt64 $fv.SMTotalSize
             if ($null -eq $total) { $noSM++; $total = $size }                     # storage metrics not computed yet
             elseif ($total -lt $size -or $total -ge [int]::MaxValue) { $overflow++; $total = $size }  # Int32 LookupId overflow (> 2 GB)
