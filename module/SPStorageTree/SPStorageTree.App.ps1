@@ -167,6 +167,11 @@ function Start-SPStorageTree {
             @{ tenant = $tTenant.Text.Trim(); clientId = $tClient.Text.Trim(); outDir = $tOut.Text.Trim() } | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding utf8
         } catch { Write-Verbose "Settings not saved: $($_.Exception.Message)" }
     }
+    $toFront = {
+        # sign-in happens in the browser, which takes the foreground; bring the window back afterwards
+        if ($f.WindowState -eq 'Minimized') { $f.WindowState = 'Normal' }
+        $f.TopMost = $true; $f.Activate(); $f.BringToFront(); $f.TopMost = $false
+    }
     $updateCount = {
         $n = @($table.Rows | Where-Object { $_['Scan'] }).Count
         $lCount.Text = if ($table.Rows.Count) { "$n of $($table.Rows.Count) sites ticked" } else { '' }
@@ -234,6 +239,7 @@ function Start-SPStorageTree {
         & $saveCfg
         & $runBg 'param($a) & (Get-Module SPStorageTree) { param($a) Get-SPSTSiteList @a } $a' @{ Tenant = $tTenant.Text.Trim(); ClientId = $tClient.Text.Trim() } {
             param($out, $err)
+            & $toFront
             if ($err) {
                 $S.signedIn = $false; $rTenant.Enabled = $false; $rSites.Checked = $true
                 & $log "Couldn't list the tenant's sites: $err"
@@ -289,6 +295,7 @@ function Start-SPStorageTree {
         & $runBg 'param($a) $a.Sync = $SPSTSync; & (Get-Module SPStorageTree) { param($a) Invoke-SPSTBatch @a } $a' $a {
             param($out, $err)
             $r = @($out | Where-Object { $_.PSObject.Properties['Html'] }) | Select-Object -Last 1
+            if ($err -or -not $r -or $r.Failed.Count) { & $toFront }   # only jump in front of the viewer when there's something to read
             if ($err -and -not $r) {
                 $lStatus.Text = 'Scan stopped.'; & $log "Error: $err"
                 if ($err -notmatch 'stopped') { & $msg "The scan didn't finish.`n`n$err" }
