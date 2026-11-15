@@ -285,12 +285,14 @@ function Start-SPStorageTree {
         if (-not (& $guidOk)) { & $msg 'Enter the Application (client) ID of your PnP PowerShell app registration (a GUID).'; return }
         $ticked = @($table.Rows | Where-Object { $_['Scan'] } | ForEach-Object { [string]$_['URL'] })
         $pasted = @($tUrls.Lines | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        # a site URL typed into the filter box (easy mistake): offer to scan it
-        $fq = $tFilter.Text.Trim()
-        if (-not $ticked -and -not $pasted -and $rSites.Checked -and $fq -match '^https://[A-Za-z0-9-]+\.sharepoint\.com(/.*)?$') {
-            $ans = [System.Windows.Forms.MessageBox]::Show($f, "That URL is in the filter box, which only filters the list.`n`nScan this site?`n`n$fq", 'SharePoint Storage Tree', 'YesNo', 'Question')
-            if ($ans -ne 'Yes') { return }
-            $tUrls.Text = $fq; $tFilter.Text = ''; $pasted = @($fq)
+        # a site URL typed into the filter box (easy mistake): offer to include it, in either mode
+        $fq = $tFilter.Text.Trim().TrimEnd('/')
+        if ($fq -match '^https://[A-Za-z0-9-]+\.sharepoint\.com(/.*)?$' -and $fq -notin $pasted -and $fq -notin $ticked) {
+            $how = if ($rTenant.Checked) { 'Add it to the sites scanned in detail?' } else { 'Scan this site?' }
+            $ans = [System.Windows.Forms.MessageBox]::Show($f, "That URL is in the filter box, which only filters the list.`n`n$how`n`n$fq", 'SharePoint Storage Tree', 'YesNoCancel', 'Question')
+            if ($ans -eq 'Cancel') { return }
+            if ($ans -eq 'Yes') { $tUrls.Text = (@($pasted) + $fq) -join "`r`n"; $pasted = @($pasted) + $fq }
+            $tFilter.Text = ''
         }
         $bad = @($pasted | Where-Object { $_ -notmatch '^https://[A-Za-z0-9-]+\.sharepoint\.com(/.*)?$' })
         if ($bad) { & $msg "These don't look like SharePoint Online site URLs:`n`n$($bad -join "`n")"; return }
