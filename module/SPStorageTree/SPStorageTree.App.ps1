@@ -192,6 +192,7 @@ function Start-SPStorageTree {
         $grid.Columns['Scan'].HeaderText = ''; $grid.Columns['Scan'].FillWeight = 8; $grid.Columns['Scan'].SortMode = 'NotSortable'
         $grid.Columns['Size (MB)'].DefaultCellStyle.Format = 'N0'; $grid.Columns['Size (MB)'].DefaultCellStyle.Alignment = 'MiddleRight'
         $grid.Columns['Size (MB)'].FillWeight = 22; $grid.Columns['Last change'].FillWeight = 30
+        $grid.Columns['Last change'].DefaultCellStyle.Format = 'yyyy-MM-dd HH:mm'   # short and unambiguous; fits the column
         foreach ($c in 'Site', 'Size (MB)', 'URL', 'Last change') { $grid.Columns[$c].ReadOnly = $true }
         & $placeAll
     }
@@ -201,7 +202,14 @@ function Start-SPStorageTree {
         $pasted = @($tUrls.Lines | Where-Object { $_.Trim() }).Count
         $ok = $rTenant.Checked -or $sel -gt 0 -or $pasted -gt 0
         $bScan.Enabled = (-not $S.busy) -and $ok
-        if (-not $S.busy -and -not $ok -and $lStatus.Text -notmatch '^(Done|Scan stopped|Something)') { $lStatus.Text = 'Select at least one site, or paste a URL below.' }
+        $hint = 'Select at least one site, or paste a URL below.'
+        if (-not $S.busy) {
+            if (-not $ok -and $lStatus.Text -notmatch '^(Done|Scan stopped|Something)') { $lStatus.Text = $hint }
+            elseif ($ok -and $lStatus.Text -eq $hint) {
+                $lStatus.Text = if ($rTenant.Checked) { 'Ready to scan the whole tenant.' }
+                                else { "Ready to scan $($sel + $pasted) site(s)." }
+            }
+        }
     }
     $updateCount = {
         $n = @($table.Rows | Where-Object { $_['Scan'] }).Count
