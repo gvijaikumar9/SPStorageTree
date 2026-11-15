@@ -95,7 +95,7 @@ function Start-SPStorageTree {
 
     .DESCRIPTION
     Windows only. The same read-only scanner as Get-SPStorageTree, with a window instead of parameters.
-    SharePoint admins (app with AllSites.FullControl) get a list of every site with its size to tick from.
+    SharePoint admins (app with AllSites.FullControl) get a list of every site with its size to select from.
     Everyone else pastes the site URLs they want to scan. Reports and the viewer page are saved in the
     output folder (default: Documents\SPStorageTree).
 
@@ -130,15 +130,13 @@ function Start-SPStorageTree {
     $bSign = Add-Ctl Button @{ Text = 'Sign in and list sites'; Location = '504,36'; Width = 170; Height = 27 }
     [void](Add-Ctl Label @{ Text = 'SharePoint admins: sign in to pick from every site. Others: paste site URLs below.'; Location = '688,30'; Size = '270,40'; Anchor = $TLR; ForeColor = [System.Drawing.Color]::DimGray })
 
-    $rSites = Add-Ctl RadioButton @{ Text = 'Scan the ticked sites in detail'; Location = '16,78'; AutoSize = $true; Checked = $true }
-    $rTenant = Add-Ctl RadioButton @{ Text = 'Whole tenant: every site''s total, plus the ticked sites and the largest'; Location = '16,100'; AutoSize = $true; Enabled = $false }
+    $rSites = Add-Ctl RadioButton @{ Text = 'Scan the selected sites in detail'; Location = '16,78'; AutoSize = $true; Checked = $true }
+    $rTenant = Add-Ctl RadioButton @{ Text = 'Whole tenant: every site''s total, plus the selected sites and the largest'; Location = '16,100'; AutoSize = $true; Enabled = $false }
     $nTop = Add-Ctl NumericUpDown @{ Location = '0,98'; Width = 55; Minimum = 0; Maximum = 1000; Value = 3; Enabled = $false }
     $lTop = Add-Ctl Label @{ Text = 'in detail'; Location = '0,101'; AutoSize = $true }; $nTop.Left = $rTenant.Right + 2; $lTop.Left = $nTop.Right + 6
 
-    $tFilter = Add-Ctl TextBox @{ Location = '16,130'; Width = 260; PlaceholderText = 'Filter the list (type part of a name)' }
-    $bAll = Add-Ctl Button @{ Text = 'Tick all'; Location = '288,128'; Width = 80 }
-    $bNone = Add-Ctl Button @{ Text = 'Tick none'; Location = '374,128'; Width = 80 }
-    $lCount = Add-Ctl Label @{ Text = ''; Location = '466,132'; AutoSize = $true; ForeColor = [System.Drawing.Color]::DimGray }
+    $tFilter = Add-Ctl TextBox @{ Location = '16,130'; Width = 320; PlaceholderText = 'Filter the list (type part of a site name or URL)' }
+    $lCount = Add-Ctl Label @{ Text = ''; Location = '350,133'; AutoSize = $true; ForeColor = [System.Drawing.Color]::DimGray }
 
     $table = [System.Data.DataTable]::new()
     [void]$table.Columns.Add('Scan', [bool]); [void]$table.Columns.Add('Site', [string]); [void]$table.Columns.Add('Size (MB)', [double])
@@ -146,6 +144,10 @@ function Start-SPStorageTree {
     $grid = Add-Ctl DataGridView @{ Location = '16,160'; Size = '932,250'; Anchor = $ALL; AllowUserToAddRows = $false; AllowUserToDeleteRows = $false
                                     RowHeadersVisible = $false; SelectionMode = 'FullRowSelect'; AutoSizeColumnsMode = 'Fill'; BackgroundColor = [System.Drawing.SystemColors]::Window }
     $grid.DataSource = $table.DefaultView
+    # select-all / clear-all checkbox drawn over the header of the first column; acts on the rows the filter shows
+    $cAll = [System.Windows.Forms.CheckBox]@{ Size = [System.Drawing.Size]::new(15, 15); BackColor = [System.Drawing.Color]::Transparent; Visible = $false }
+    $grid.Controls.Add($cAll)
+    $tips = [System.Windows.Forms.ToolTip]::new(); $tips.SetToolTip($cAll, 'Select all / clear all (the rows the filter shows)')
 
     [void](Add-Ctl Label @{ Text = 'Or paste site URLs, one per line'; Location = '16,418'; AutoSize = $true; Anchor = $BL })
     $tUrls = Add-Ctl TextBox @{ Location = '16,436'; Size = '932,50'; Multiline = $true; AcceptsReturn = $true; ScrollBars = 'Vertical'; Anchor = $BLR; PlaceholderText = 'https://contoso.sharepoint.com/sites/ProjectHub' }
@@ -180,19 +182,44 @@ function Start-SPStorageTree {
         if ($f.WindowState -eq 'Minimized') { $f.WindowState = 'Normal' }
         $f.TopMost = $true; $f.Activate(); $f.BringToFront(); $f.TopMost = $false
     }
+    $placeAll = {
+        if (-not $grid.Columns.Count) { return }
+        $rc = $grid.GetCellDisplayRectangle(0, -1, $true)
+        $cAll.Location = [System.Drawing.Point]::new($rc.X + [int](($rc.Width - 15) / 2), $rc.Y + [int](($rc.Height - 15) / 2))
+        $cAll.Visible = $table.Rows.Count -gt 0; $cAll.BringToFront()
+    }
+    $setupGrid = {
+        $grid.Columns['Scan'].HeaderText = ''; $grid.Columns['Scan'].FillWeight = 8; $grid.Columns['Scan'].SortMode = 'NotSortable'
+        $grid.Columns['Size (MB)'].DefaultCellStyle.Format = 'N0'; $grid.Columns['Size (MB)'].DefaultCellStyle.Alignment = 'MiddleRight'
+        $grid.Columns['Size (MB)'].FillWeight = 22; $grid.Columns['Last change'].FillWeight = 30
+        foreach ($c in 'Site', 'Size (MB)', 'URL', 'Last change') { $grid.Columns[$c].ReadOnly = $true }
+        & $placeAll
+    }
+    $canScan = {
+        # Scan stays disabled until there is something to scan (whole tenant always has something)
+        $sel = @($table.Rows | Where-Object { $_['Scan'] }).Count
+        $pasted = @($tUrls.Lines | Where-Object { $_.Trim() }).Count
+        $ok = $rTenant.Checked -or $sel -gt 0 -or $pasted -gt 0
+        $bScan.Enabled = (-not $S.busy) -and $ok
+        if (-not $S.busy -and -not $ok -and $lStatus.Text -notmatch '^(Done|Scan stopped|Something)') { $lStatus.Text = 'Select at least one site, or paste a URL below.' }
+    }
     $updateCount = {
         $n = @($table.Rows | Where-Object { $_['Scan'] }).Count
         $shown = $table.DefaultView.Count
         $lCount.Text = if (-not $table.Rows.Count) { '' }
-                       elseif ($shown -lt $table.Rows.Count) { "$n of $($table.Rows.Count) sites ticked  |  $shown shown by the filter" }
-                       else { "$n of $($table.Rows.Count) sites ticked" }
+                       elseif ($shown -lt $table.Rows.Count) { "$n of $($table.Rows.Count) sites selected  |  $shown shown by the filter" }
+                       else { "$n of $($table.Rows.Count) sites selected" }
+        $shownSel = @($table.DefaultView | Where-Object { $_['Scan'] }).Count
+        $cAll.Checked = $shown -gt 0 -and $shownSel -eq $shown
+        & $canScan
     }
     $setBusy = {
         param([bool]$b)
         $S.busy = $b
-        foreach ($c in $bSign, $bScan, $tTenant, $tClient, $rSites, $grid, $tUrls, $cSub, $cNames, $tOut, $bBrowse, $bAll, $bNone, $tFilter) { $c.Enabled = -not $b }
+        foreach ($c in $bSign, $tTenant, $tClient, $rSites, $grid, $cAll, $tUrls, $cSub, $cNames, $tOut, $bBrowse, $tFilter) { $c.Enabled = -not $b }
         $rTenant.Enabled = (-not $b) -and $S.signedIn; $nTop.Enabled = (-not $b) -and $S.signedIn -and $rTenant.Checked
         $bCancel.Enabled = $b
+        & $canScan
         $bar.Style = if ($b) { 'Marquee' } else { 'Blocks' }; if (-not $b) { $bar.Value = 0 }
     }
     $runBg = {
@@ -261,11 +288,9 @@ function Start-SPStorageTree {
             $table.Rows.Clear()
             foreach ($site in $out) { [void]$table.Rows.Add($false, $site.Title, $site.SizeMB, $site.Url, $(if ($site.LastChange) { [datetime]$site.LastChange } else { [DBNull]::Value })) }
             $S.signedIn = $true; $rTenant.Enabled = $true
-            $grid.Columns['Size (MB)'].DefaultCellStyle.Format = 'N0'; $grid.Columns['Size (MB)'].DefaultCellStyle.Alignment = 'MiddleRight'
-            $grid.Columns['Scan'].FillWeight = 12; $grid.Columns['Size (MB)'].FillWeight = 22; $grid.Columns['Last change'].FillWeight = 30
-            foreach ($c in 'Site', 'Size (MB)', 'URL', 'Last change') { $grid.Columns[$c].ReadOnly = $true }
+            & $setupGrid
             $total = ($out | Measure-Object SizeMB -Sum).Sum
-            $lStatus.Text = "Signed in. $($out.Count) sites, $('{0:N0}' -f $total) MB in total. Tick the sites to scan."
+            $lStatus.Text = "Signed in. $($out.Count) sites, $('{0:N0}' -f $total) MB in total. Select the sites to scan."
             & $log "Listed $($out.Count) sites."
             & $updateCount
         } 'Signing in: finish the sign-in in your browser (if it asks which account, pick your admin account)'
@@ -275,11 +300,17 @@ function Start-SPStorageTree {
         $table.DefaultView.RowFilter = if ($q) { "Site LIKE '%$q%' OR URL LIKE '%$q%'" } else { '' }
         & $updateCount
     })
-    $bAll.Add_Click({ foreach ($r in $table.DefaultView) { $r['Scan'] = $true }; & $updateCount })
-    $bNone.Add_Click({ foreach ($r in $table.Rows) { $r['Scan'] = $false }; & $updateCount })
+    $cAll.Add_Click({
+        $grid.EndEdit() | Out-Null
+        foreach ($r in @($table.DefaultView)) { $r['Scan'] = $cAll.Checked }   # only the rows the filter shows
+        $grid.Refresh(); & $updateCount
+    })
     $grid.Add_CurrentCellDirtyStateChanged({ if ($grid.IsCurrentCellDirty) { [void]$grid.CommitEdit('CurrentCellChange') } })
     $grid.Add_CellValueChanged({ & $updateCount })
-    $rTenant.Add_CheckedChanged({ $nTop.Enabled = $rTenant.Checked -and $rTenant.Enabled })
+    foreach ($ev in 'ColumnWidthChanged', 'SizeChanged', 'Scroll', 'DataBindingComplete') { $grid."add_$ev"({ & $placeAll }) }
+    $tUrls.Add_TextChanged({ & $canScan })
+    $rSites.Add_CheckedChanged({ & $canScan })
+    $rTenant.Add_CheckedChanged({ $nTop.Enabled = $rTenant.Checked -and $rTenant.Enabled; & $canScan })
     $bBrowse.Add_Click({
         $d = [System.Windows.Forms.FolderBrowserDialog]@{ Description = 'Folder for reports'; SelectedPath = $tOut.Text }
         if ($d.ShowDialog($f) -eq 'OK') { $tOut.Text = $d.SelectedPath }
@@ -292,26 +323,17 @@ function Start-SPStorageTree {
         if (-not (& $guidOk)) { & $msg 'Enter the Application (client) ID of your PnP PowerShell app registration (a GUID).'; return }
         $ticked = @($table.Rows | Where-Object { $_['Scan'] } | ForEach-Object { [string]$_['URL'] })
         $pasted = @($tUrls.Lines | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        # a site URL typed into the filter box (easy mistake): offer to include it, in either mode
-        $fq = $tFilter.Text.Trim().TrimEnd('/')
-        if ($fq -match '^https://[A-Za-z0-9-]+\.sharepoint\.com(/.*)?$' -and $fq -notin $pasted -and $fq -notin $ticked) {
-            $how = if ($rTenant.Checked) { 'Add it to the sites scanned in detail?' } else { 'Scan this site?' }
-            $ans = [System.Windows.Forms.MessageBox]::Show($f, "That URL is in the filter box, which only filters the list.`n`n$how`n`n$fq", 'SharePoint Storage Tree', 'YesNoCancel', 'Question')
-            if ($ans -eq 'Cancel') { return }
-            if ($ans -eq 'Yes') { $tUrls.Text = (@($pasted) + $fq) -join "`r`n"; $pasted = @($pasted) + $fq }
-            $tFilter.Text = ''
-        }
         $bad = @($pasted | Where-Object { $_ -notmatch '^https://[A-Za-z0-9-]+\.sharepoint\.com(/.*)?$' })
         if ($bad) { & $msg "These don't look like SharePoint Online site URLs:`n`n$($bad -join "`n")"; return }
         $out = $tOut.Text.Trim(); if (-not $out) { & $msg 'Choose a folder for the reports.'; return }
         $mode = if ($rTenant.Checked) { 'Tenant' } else { 'Sites' }
         $sites = @($ticked + $pasted | Select-Object -Unique)
-        if ($mode -eq 'Sites' -and -not $sites) { & $msg 'Tick at least one site in the list, or paste a site URL.' 'Information'; return }
+        if ($mode -eq 'Sites' -and -not $sites) { & $msg 'Select at least one site in the list, or paste a site URL.' 'Information'; return }
         if ($mode -eq 'Tenant' -and -not (& $tenantOk)) { & $msg 'Enter the tenant name.'; return }
         & $saveCfg
         $a = @{ Mode = $mode; ClientId = $tClient.Text.Trim(); Sites = $sites; OutDir = $out; IncludeSubsites = $cSub.Checked; ExcludeUserNames = $cNames.Checked }
         if ($mode -eq 'Tenant') { $a.Tenant = $tTenant.Text.Trim(); $a.Top = [int]$nTop.Value }
-        $what = if ($mode -eq 'Tenant') { "Scanning the whole tenant ($($sites.Count) ticked + largest $([int]$nTop.Value) in detail)" } else { "Scanning $($sites.Count) site(s)" }
+        $what = if ($mode -eq 'Tenant') { "Scanning the whole tenant ($($sites.Count) selected + largest $([int]$nTop.Value) in detail)" } else { "Scanning $($sites.Count) site(s)" }
         $what += '. If a browser window opens, finish the sign-in there'
         & $runBg 'param($a) $a.Sync = $SPSTSync; & (Get-Module SPStorageTree) { param($a) Invoke-SPSTBatch @a } $a' $a {
             param($out, $err)
@@ -346,8 +368,8 @@ function Start-SPStorageTree {
                                @($false, 'List Dashboard Demo', 11, 'https://contoso.sharepoint.com/sites/listdash', [datetime]'2026-11-11'),
                                @($true, 'PowerShell Demo', 2, 'https://contoso.sharepoint.com/sites/PSDemo', [datetime]'2026-11-15'))) { [void]$table.Rows.Add($row) }
             $S.signedIn = $true; $rTenant.Enabled = $true; $tTenant.Text = 'contoso'; $tClient.Text = '00000000-0000-0000-0000-000000000000'
-            $grid.Columns['Size (MB)'].DefaultCellStyle.Format = 'N0'; $grid.Columns['Scan'].FillWeight = 12; $grid.Columns['Size (MB)'].FillWeight = 22; $grid.Columns['Last change'].FillWeight = 30
-            & $updateCount; $lStatus.Text = 'Signed in. 3 sites, 153 MB in total. Tick the sites to scan.'
+            & $setupGrid
+            & $updateCount; $lStatus.Text = 'Signed in. 3 sites, 153 MB in total. Select the sites to scan.'
             $f.Refresh(); [System.Windows.Forms.Application]::DoEvents()
             $bmp = [System.Drawing.Bitmap]::new($f.Width, $f.Height); $f.DrawToBitmap($bmp, [System.Drawing.Rectangle]::new(0, 0, $f.Width, $f.Height))
             $bmp.Save($env:SPST_APP_SCREENSHOT); $bmp.Dispose(); $f.Close()
