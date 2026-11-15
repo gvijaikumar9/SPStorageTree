@@ -21,10 +21,10 @@ jobs:
       - name: Install dependencies
         shell: pwsh
         run: |
-          Set-PSResourceRepository -Name PSGallery -Trusted
-          Install-PSResource -Name PnP.PowerShell -Version '[3.0.0,4.0.0)' -Quiet
-          Install-PSResource -Name Pester -Version '[5.5.0,7.0.0)' -Quiet
-          Install-PSResource -Name PSScriptAnalyzer -Quiet
+          # fresh runners have no PSResourceGet repository store yet, so trust per install instead of Set-PSResourceRepository
+          Install-PSResource -Name PnP.PowerShell -Version '[3.0.0,4.0.0)' -TrustRepository -Quiet
+          Install-PSResource -Name Pester -Version '[5.5.0,7.0.0)' -TrustRepository -Quiet
+          Install-PSResource -Name PSScriptAnalyzer -TrustRepository -Quiet
 
       - name: Build and analyze
         shell: pwsh
