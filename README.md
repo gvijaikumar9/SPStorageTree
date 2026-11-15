@@ -67,6 +67,16 @@ and shares the Client ID it prints. Everyone then signs in with their own accoun
 
 These are delegated permissions: the app can never do more than the signed-in person can. The tool only reads, whichever permission the app has. If your organization doesn't want a FullControl app, use a read-only app and run `-Site` scans per site instead of `-Tenant`.
 
+## Windows app
+
+Prefer clicking to typing? Run **`Start-SPStorageTree`**, or double-click **`SPStorageTree.exe`** in the module folder (also attached to each [GitHub release](https://github.com/gvijaikumar9/SPStorageTree/releases)).
+
+1. Enter your tenant name and the app's Client ID.
+2. **SharePoint admins:** click **Sign in and list sites** to get every site with its size, then tick the ones to scan, or choose **Whole tenant**. **Everyone else:** paste the URLs of sites you own.
+3. Click **Scan**. When it finishes, the viewer opens with all the chosen sites in one view. Reports are saved in **Documents\SPStorageTree** (or the folder you pick).
+
+The exe is a small launcher: it still needs PowerShell 7.4+ and PnP.PowerShell, and tells you the one command to run if either is missing. It isn't code-signed, so the first time Windows may show **Windows protected your PC**: choose **More info** > **Run anyway**.
+
 ## Scan
 
 ```powershell

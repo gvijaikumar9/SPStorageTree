@@ -2,7 +2,7 @@
 # SharePoint Storage Tree - scanner. Read-only: it never changes anything in SharePoint.
 # Emits report schema v1.1 (see viewer/storagetree.html header for the contract).
 
-$script:GeneratorVersion = '0.1.1'
+$script:GeneratorVersion = '0.2.0'
 $script:Activity = 'SharePoint Storage Tree'
 
 function ConvertTo-SPSTInt64 {
@@ -121,7 +121,7 @@ function Get-SPSTWebScan {
             elseif ($total -lt $size -or $total -ge [int]::MaxValue) { $overflow++; $total = $size }  # Int32 LookupId overflow (> 2 GB)
             $dir = [string]$fv.FileDirRef
             $folder = if ($dir.Length -gt $root.Length) { $dir.Substring($root.Length).Trim('/') } else { '' }
-            $label = [string]$fv._UIVersionString
+            $verLabel = [string]$fv._UIVersionString
             $editor = $fv.Editor
             $files.Add([ordered]@{
                 library      = $l.Title
@@ -129,14 +129,14 @@ function Get-SPSTWebScan {
                 name         = [string]$fv.FileLeafRef
                 size         = $size
                 totalSize    = $total
-                versionCount = Get-SPSTMajorVersion $label
-                versionLabel = $label
+                versionCount = Get-SPSTMajorVersion $verLabel
+                versionLabel = $verLabel
                 modified     = ConvertTo-SPSTIso $fv.Modified
                 modifiedBy   = if ($ExcludeUserNames) { '' } elseif ($editor -is [Microsoft.SharePoint.Client.FieldUserValue]) { $editor.LookupValue } else { [string]$editor }
                 created      = ConvertTo-SPSTIso $fv.Created
                 url          = [string]$fv.FileRef
             })
-            $refs.Add(@{ ref = [string]$fv.FileRef; hist = $total - $size; old = (Get-SPSTMajorVersion $label) - 1 })
+            $refs.Add(@{ ref = [string]$fv.FileRef; hist = $total - $size; old = (Get-SPSTMajorVersion $verLabel) - 1 })
             $n++
         }
         $libsOut.Add([ordered]@{ title = $l.Title; url = $root; itemCount = $n; hidden = [bool]$l.Hidden; template = [int]$l.BaseTemplate })
@@ -458,4 +458,6 @@ function Show-SPStorageTree {
     }
 }
 
-Export-ModuleMember -Function Get-SPStorageTree, Show-SPStorageTree
+. (Join-Path $PSScriptRoot 'SPStorageTree.App.ps1')      # Windows app: Start-SPStorageTree + batch engine
+
+Export-ModuleMember -Function Get-SPStorageTree, Show-SPStorageTree, Start-SPStorageTree

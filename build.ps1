@@ -11,6 +11,16 @@ Copy-Item (Join-Path (Join-Path $PSScriptRoot 'viewer') 'storagetree.html') (Joi
 Copy-Item (Join-Path $PSScriptRoot 'LICENSE') (Join-Path $mod 'LICENSE') -Force
 Write-Host 'Viewer + LICENSE copied into the module.'
 
+# Windows launcher (SPStorageTree.exe): compiled with the .NET Framework C# compiler that ships with Windows.
+$csc = if ($IsWindows) { Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe' }
+if ($csc -and (Test-Path $csc)) {
+    $exe = Join-Path $mod 'SPStorageTree.exe'
+    $src = Join-Path (Join-Path $PSScriptRoot 'launcher') 'SPStorageTree.Launcher.cs'
+    $o = & $csc /nologo /target:winexe /optimize+ "/out:$exe" /r:System.Windows.Forms.dll $src 2>&1
+    if ($LASTEXITCODE) { $o | Write-Host; throw 'Launcher build failed.' }
+    Write-Host "Launcher built: SPStorageTree.exe ($((Get-Item $exe).Length) bytes)."
+} else { Write-Host 'Launcher skipped (not Windows, or no C# compiler).' }
+
 $m = Test-ModuleManifest (Join-Path $mod 'SPStorageTree.psd1')
 Write-Host "Manifest OK: $($m.Name) $($m.Version), exports $($m.ExportedFunctions.Keys -join ', ')"
 

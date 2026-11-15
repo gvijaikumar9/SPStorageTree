@@ -8,3 +8,4 @@ scan-*.json
 # build output (copied from /viewer and /LICENSE by build.ps1)
 module/SPStorageTree/viewer/
 module/SPStorageTree/LICENSE
+module/SPStorageTree/SPStorageTree.exe

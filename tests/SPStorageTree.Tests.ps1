@@ -18,8 +18,11 @@ Describe 'Module' {
     It 'has a valid manifest' {
         { Test-ModuleManifest (Join-Path $ModuleDir 'SPStorageTree.psd1') } | Should -Not -Throw
     }
-    It 'exports exactly the two public commands' {
-        (Get-Command -Module SPStorageTree).Name | Sort-Object | Should -Be @('Get-SPStorageTree', 'Show-SPStorageTree')
+    It 'exports exactly the three public commands' {
+        (Get-Command -Module SPStorageTree).Name | Sort-Object | Should -Be @('Get-SPStorageTree', 'Show-SPStorageTree', 'Start-SPStorageTree')
+    }
+    It 'keeps the app engine private' {
+        Get-Command Invoke-SPSTBatch, Get-SPSTSiteList -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
     }
     It 'ships the viewer with a data slot' {
         $v = Join-Path (Join-Path $ModuleDir 'viewer') 'storagetree.html'
@@ -80,17 +83,38 @@ Describe 'Helpers' {
     }
 }
 
+Describe 'Code safety' {
+    It 'no function reassigns one of its own parameters under a different case' {
+        # PowerShell variable names ignore case: '$label = ...' silently overwrites a '$Label' parameter.
+        $files = Get-ChildItem $ModuleDir -Filter *.ps*1 | Where-Object Extension -in '.psm1', '.ps1'
+        $hits = foreach ($file in $files) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+                $params = @($fn.Body.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+                $assigned = $fn.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] }, $false) |
+                    ForEach-Object { $_.Left } | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] } |
+                    ForEach-Object { $_.VariablePath.UserPath }
+                foreach ($a in $assigned) {
+                    $p = $params | Where-Object { $_ -ieq $a -and $_ -cne $a }
+                    if ($p) { "$($fn.Name): `$$a overwrites parameter `$$p" }
+                }
+            }
+        }
+        $hits | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Get-SPStorageTree input validation (no network)' {
     It 'rejects <Name>' -TestCases @(
-        @{ Name = 'a non-SharePoint site URL'; Args = @{ Site = 'https://example.com/sites/x'; ClientId = '00000000-0000-0000-0000-000000000001' } }
-        @{ Name = 'an http site URL'; Args = @{ Site = 'http://contoso.sharepoint.com/sites/x'; ClientId = '00000000-0000-0000-0000-000000000001' } }
-        @{ Name = 'a bad tenant name'; Args = @{ Tenant = 'contoso!'; ClientId = '00000000-0000-0000-0000-000000000001' } }
-        @{ Name = 'a ClientId that is not a GUID'; Args = @{ Site = 'https://contoso.sharepoint.com/sites/x'; ClientId = 'my-app' } }
-        @{ Name = 'a bad -DeepScan URL'; Args = @{ Tenant = 'contoso'; DeepScan = 'contoso/sites/x'; ClientId = '00000000-0000-0000-0000-000000000001' } }
-        @{ Name = 'a zero version threshold'; Args = @{ Site = 'https://contoso.sharepoint.com/sites/x'; ClientId = '00000000-0000-0000-0000-000000000001'; VersionDetailMinVersions = 0 } }
+        @{ Name = 'a non-SharePoint site URL'; Params = @{ Site = 'https://example.com/sites/x'; ClientId = '00000000-0000-0000-0000-000000000001' } }
+        @{ Name = 'an http site URL'; Params = @{ Site = 'http://contoso.sharepoint.com/sites/x'; ClientId = '00000000-0000-0000-0000-000000000001' } }
+        @{ Name = 'a bad tenant name'; Params = @{ Tenant = 'contoso!'; ClientId = '00000000-0000-0000-0000-000000000001' } }
+        @{ Name = 'a ClientId that is not a GUID'; Params = @{ Site = 'https://contoso.sharepoint.com/sites/x'; ClientId = 'my-app' } }
+        @{ Name = 'a bad -DeepScan URL'; Params = @{ Tenant = 'contoso'; DeepScan = 'contoso/sites/x'; ClientId = '00000000-0000-0000-0000-000000000001' } }
+        @{ Name = 'a zero version threshold'; Params = @{ Site = 'https://contoso.sharepoint.com/sites/x'; ClientId = '00000000-0000-0000-0000-000000000001'; VersionDetailMinVersions = 0 } }
     ) {
-        param($Name, $Args)
-        { Get-SPStorageTree @Args } | Should -Throw
+        param($Name, $Params)
+        { Get-SPStorageTree @Params } | Should -Throw
     }
     It 'fails on a missing output folder before signing in' {
         { Get-SPStorageTree -Site https://contoso.sharepoint.com/sites/x -ClientId $Guid -Out (Join-Path $TestDrive 'missing/r.json') } |
