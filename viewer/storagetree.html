@@ -463,10 +463,13 @@ const S = { staleMonths: 24, largeMB: 50, sizeBy: "total", colorBy: "type", tab:
 /* ---------------- model ---------------- */
 /* any report shape -> { scope, scannedAt, generator, tenant, sites[] }. v1.0 single-site reports still load. */
 const normUrl = u => String(u || "").replace(/\/+$/, "").toLowerCase();
+const toDate = v => { if (v == null || v === "") return null; const d = new Date(v); return isNaN(d) ? null : d; };   // bad input -> null, never a crash
+const nonNeg = v => { const n = +v; return isFinite(n) && n > 0 ? n : 0; };
 function normalize(report){
   const raw = Array.isArray(report.sites) ? report.sites
     : [{ ...(report.site || {}), libraries: report.libraries, files: report.files }];
-  const sites = raw.map(s => ({ ...s, deep: s.deep !== false && Array.isArray(s.files), scannedAt: s.scannedAt || report.scannedAt }));
+  const sites = raw.filter(s => s && typeof s === "object")
+    .map(s => ({ ...s, deep: s.deep !== false && Array.isArray(s.files), scannedAt: s.scannedAt || report.scannedAt }));
   return { scope: report.scope || (sites.length > 1 ? "tenant" : "site"), scannedAt: report.scannedAt, generator: report.generator,
            tenant: report.tenant, sites };
 }
@@ -485,28 +488,28 @@ const isReport = r => r && (Array.isArray(r.files) || Array.isArray(r.sites));
 
 function buildModel(report){
   const N = report;                       // already normalized
-  const scanDate = new Date(N.scannedAt || Date.now());
+  const scanDate = toDate(N.scannedAt) || new Date();
   const files = [];
   const webs = N.sites.map(s => ({ s, node: s.deep
     ? { name: s.title || s.url || "Site", kind: "site", site: s, children: [], map: new Map(), parent: null }
-    : { name: s.title || s.url || "Site", kind: "ov", site: s, bytes: +s.storageUsed || 0, parent: null } }));
+    : { name: s.title || s.url || "Site", kind: "ov", site: s, bytes: nonNeg(s.storageUsed), parent: null } }));
   const multi = webs.length > 1;
 
   for (const { s, node } of webs){
     if (!s.deep) continue;
-    const siteScan = new Date(s.scannedAt || N.scannedAt || Date.now());
+    const siteScan = toDate(s.scannedAt) || scanDate;
     // system libraries (galleries, app catalog, client side assets, hidden lists) count toward storage
     // but are never flagged as stale / ROT / Copilot risk: they aren't user content
     const sysLib = new Set((s.libraries || []).filter(l => l.hidden || SYSTEM_TEMPLATES.has(+l.template)).map(l => l.title));
-    (s.files || []).forEach(rf => {
-      const size = +rf.size || 0, total = Math.max(size, +rf.totalSize || size), ext = extOf(rf.name || "");
-      const modified = rf.modified ? new Date(rf.modified) : null;
+    (s.files || []).filter(rf => rf && typeof rf === "object").forEach(rf => {
+      const size = nonNeg(rf.size), total = Math.max(size, nonNeg(rf.totalSize)), ext = extOf(String(rf.name || ""));
+      const modified = toDate(rf.modified);
       const f = {
         id: files.length, site: node.name, siteUrl: s.url || "", web: node,
-        library: rf.library || "(unknown)", folder: (rf.folder || "").replace(/^\/+|\/+$/g, ""),
-        name: rf.name || "(unnamed)", ext, cat: catOf(ext), size, total,
-        versionCount: +rf.versionCount || 1, modified, modifiedBy: rf.modifiedBy || "",
-        created: rf.created ? new Date(rf.created) : null, url: rf.url || "",
+        library: String(rf.library || "(unknown)"), folder: String(rf.folder || "").replace(/^\/+|\/+$/g, ""),
+        name: String(rf.name || "(unnamed)"), ext, cat: catOf(ext), size, total,
+        versionCount: Math.max(1, Math.round(nonNeg(rf.versionCount))), modified, modifiedBy: String(rf.modifiedBy || ""),
+        created: toDate(rf.created), url: String(rf.url || ""),
         ageDays: modified ? Math.max(0, (siteScan - modified) / DAY) : 0
       };
       f.system = sysLib.has(f.library);
@@ -515,7 +518,7 @@ function buildModel(report){
       const raw = rf.versions;
       f.hist = null; f.histDates = null;
       if (Array.isArray(raw) && raw.length){
-        const vs = raw.map(v => ({ s: +v.size || 0, d: v.created ? +new Date(v.created) : NaN }));
+        const vs = raw.map(v => ({ s: nonNeg(v && v.size), d: v && toDate(v.created) ? +toDate(v.created) : NaN }));
         const dated = vs.every(v => !isNaN(v.d));
         if (dated) vs.sort((a, b) => b.d - a.d); else vs.reverse(); // undated: assume oldest-first
         f.hist = vs.map(v => v.s);
@@ -577,7 +580,7 @@ function buildModel(report){
     if (n.kind === "other" || n.kind === "ov"){
       n.total = n.bytes; n.overhead = n.kind === "other" ? n.bytes : 0; n.ov = n.kind === "ov" ? n.bytes : 0;
       n.current = n.version = n.count = 0; n.catSize = {};
-      n.newest = n.kind === "ov" && n.site.lastModified ? new Date(n.site.lastModified) : null;
+      n.newest = n.kind === "ov" ? toDate(n.site.lastModified) : null;
       return;
     }
     n.total = n.current = n.version = n.overhead = n.count = n.ov = 0; n.newest = null; n.catSize = {};
@@ -947,7 +950,12 @@ function setHL(n, fromTile){
 }
 
 /* ---------------- CSV ---------------- */
-function csvCell(v){ v = v == null ? "" : String(v); return /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v; }
+function csvCell(v){
+  if (typeof v === "number") return isFinite(v) ? String(v) : "";
+  v = v == null ? "" : String(v);
+  if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;   // stop Excel treating a file name like "=HYPERLINK(...)" as a formula
+  return /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
 function download(name, text){
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob(["﻿" + text], { type: "text/csv;charset=utf-8" }));
@@ -1019,6 +1027,8 @@ function load(input, sample){
   $("#ageRef").textContent = `File ages are measured from the scan date (${fmtDate(M.scanDate)}).`;
   const parts = [];
   if (sample) parts.push(`<b>Sample data.</b> This is ${SAMPLE_TEXT[sample]}. To see your own, run <code>Get-SPStorageTree -Site &lt;url&gt; -Out report.json</code> (add <code>-IncludeSubsites</code>, or use <code>-Tenant</code>), then drop report.json on this page or click <b>Load report.json</b>. You can drop several reports at once.`);
+  const newer = list.filter(r => parseInt(r.schemaVersion, 10) > 1);
+  if (newer.length) parts.push(`<b>Newer report format.</b> ${newer.length === 1 ? "This report was" : "Some reports were"} made by a newer version of SPStorageTree (format ${esc(newer[0].schemaVersion)}). Some details may not show; get the latest viewer from the module or GitHub.`);
   if (list.length > 1) parts.push(`<b>${fmtInt(list.length)} reports combined.</b> Where a site appears in more than one, the newest scan is used.`);
   if (M.partial.length) parts.push(`<b>⚠ Partial scan:</b> ${M.partial.map(s => esc(s.title || s.url)).join(", ")} ${M.partial.length === 1 ? "was" : "were"} scanned by an account that isn't a site collection admin. Libraries that account can't open are missing, and the site's total storage couldn't be read. For a complete picture, scan as a site collection admin.${M.partial.some(s => s.partialReason) ? ` (${M.partial.map(s => s.partialReason).filter(Boolean).map(esc).join("; ")})` : ""}`);
   const failed = M.ovSites.filter(n => n.site.note);

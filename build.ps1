@@ -5,8 +5,9 @@ param([switch]$SkipAnalyzer)
 $ErrorActionPreference = 'Stop'
 $mod = Join-Path $PSScriptRoot 'module\SPStorageTree'
 
-New-Item -ItemType Directory -Force (Join-Path $mod 'viewer') | Out-Null
-Copy-Item (Join-Path $PSScriptRoot 'viewer\storagetree.html') (Join-Path $mod 'viewer\storagetree.html') -Force
+$viewerOut = Join-Path $mod 'viewer'
+New-Item -ItemType Directory -Force $viewerOut | Out-Null
+Copy-Item (Join-Path (Join-Path $PSScriptRoot 'viewer') 'storagetree.html') (Join-Path $viewerOut 'storagetree.html') -Force
 Copy-Item (Join-Path $PSScriptRoot 'LICENSE') (Join-Path $mod 'LICENSE') -Force
 Write-Host 'Viewer + LICENSE copied into the module.'
 

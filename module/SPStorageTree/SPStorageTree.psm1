@@ -8,15 +8,41 @@ $script:Activity = 'SharePoint Storage Tree'
 function ConvertTo-SPSTInt64 {
     # SMTotalSize comes back as a FieldLookupValue (bytes in .LookupId); the stream sizes come back as strings.
     param($Value)
-    if ($null -eq $Value -or $Value -eq '') { return $null }
+    if ($null -eq $Value -or ($Value -is [string] -and $Value.Trim() -eq '')) { return $null }   # not "-eq ''": 0 -eq '' is true
     if ($Value -is [Microsoft.SharePoint.Client.FieldLookupValue]) { return [int64]$Value.LookupId }
     [int64]$Value
 }
 
 function ConvertTo-SPSTIso {
     param($Date)
-    if ($null -eq $Date) { return $null }
-    ([datetime]$Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    if ($null -eq $Date -or ($Date -is [string] -and $Date.Trim() -eq '')) { return $null }
+    try { ([datetime]$Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture) } catch { $null }
+}
+
+function Get-SPSTLibraryRoot {
+    # Library root folder from DefaultViewUrl ("/sites/x/Shared Documents/Forms/AllItems.aspx" -> "/sites/x/Shared Documents").
+    # Asking for RootFolder on every list needs more than AllSites.Read, DefaultViewUrl doesn't.
+    param([string]$DefaultViewUrl)
+    if ($DefaultViewUrl -match '^(.*?)/Forms/[^/]+$') { return $Matches[1] }
+    if ($DefaultViewUrl -match '^(.*)/[^/]+\.aspx$') { return $Matches[1] }
+    $DefaultViewUrl.TrimEnd('/')
+}
+
+function Resolve-SPSTOutPath {
+    # Fail fast (before a long scan) if the output folder doesn't exist.
+    param([string]$Path)
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $dir = [IO.Path]::GetDirectoryName($full)
+    if ($dir -and -not [IO.Directory]::Exists($dir)) { throw "Output folder doesn't exist: $dir" }
+    $full
+}
+
+function Write-SPSTFile {
+    # Write to a temp file, then swap it in, so an interrupted write never leaves a half-written report.
+    param([string]$Path, [string]$Text)
+    $tmp = "$Path.$PID.tmp"
+    [IO.File]::WriteAllText($tmp, $Text, [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $tmp -Destination $Path -Force
 }
 
 function Get-SPSTMajorVersion {
@@ -35,7 +61,8 @@ function Get-SPSTWebScan {
         [int]$VersionDetailMinVersions,
         [double]$VersionDetailMinHistoryMB,
         [int]$VersionBatchSize,
-        [string]$Label = 'site'
+        [string]$Label = 'site',
+        [switch]$ExcludeUserNames
     )
     $ctx = Get-PnPContext
     $warnings = $State.warnings
@@ -47,21 +74,14 @@ function Get-SPSTWebScan {
     $storageUsed = $null
     try { $usage = [int64](Get-PnPSite -Includes Usage).Usage.Storage; $State.calls++; if ($IsTop) { $storageUsed = $usage } }
     catch {
-        $partialReasons += "scanned as $($web.CurrentUser.Email), who is not a site collection admin (site total not readable; libraries with their own permissions may be missing)"
+        $who = if ($ExcludeUserNames) { 'an account' } else { @($web.CurrentUser.Email, $web.CurrentUser.LoginName, 'this account') | Where-Object { $_ } | Select-Object -First 1 }
+        $partialReasons += "scanned as $who, which is not a site collection admin (site total not readable; libraries with their own permissions may be missing)"
         $warnings.Add("$($Label): site usage not readable ($($_.Exception.Message)). Scan as a site collection admin for a complete report.")
     }
 
     # ---- libraries (all document libraries, including hidden/system ones) ----------------------
-    # Root folder path comes from DefaultViewUrl: asking for RootFolder on every list needs more than AllSites.Read.
     $lists = @(Get-PnPList -Includes DefaultViewUrl, BaseTemplate, Hidden, ItemCount | Where-Object { $_.BaseType -eq 'DocumentLibrary' }); $State.calls++
-    $libRoot = {
-        param($l)
-        $u = [string]$l.DefaultViewUrl
-        if ($u -match '^(.*?)/Forms/[^/]+$') { return $Matches[1] }
-        if ($u -match '^(.*)/[^/]+\.aspx$') { return $Matches[1] }
-        $u.TrimEnd('/')
-    }
-    $holdLib = $lists | Where-Object { (& $libRoot $_) -match '/PreservationHoldLibrary$' -or $_.Title -eq 'Preservation Hold Library' }
+    $holdLib = $lists | Where-Object { (Get-SPSTLibraryRoot $_.DefaultViewUrl) -match '/PreservationHoldLibrary$' -or $_.Title -eq 'Preservation Hold Library' }
 
     $fields = 'FileLeafRef', 'FileRef', 'FileDirRef', 'FSObjType', 'File_x0020_Size', 'SMTotalSize', 'SMTotalFileStreamSize', '_UIVersionString', 'Modified', 'Created', 'Editor'
     $files = [System.Collections.Generic.List[object]]::new()
@@ -71,27 +91,31 @@ function Get-SPSTWebScan {
     foreach ($l in $lists) {
         $i++
         Write-Progress -Activity $script:Activity -Status "$($Label): library $i of $($lists.Count) ($($l.Title))" -PercentComplete ($i / $lists.Count * 60)
-        $root = & $libRoot $l
+        $root = Get-SPSTLibraryRoot $l.DefaultViewUrl
         $items = @()
         if ($l.ItemCount -gt 0) {
             try { $items = @(Get-PnPListItem -List $l -PageSize 5000 -Fields $fields); $State.calls += [math]::Max(1, [math]::Ceiling($l.ItemCount / 5000)) }
             catch { $warnings.Add("$($Label): library '$($l.Title)': $($_.Exception.Message)"); $partialReasons += "library '$($l.Title)' not readable"; continue }
         }
         # safety net: if the view URL didn't give the real root, use the shortest folder the items live in
-        $dirs = @($items | ForEach-Object { [string]$_.FieldValues.FileDirRef } | Where-Object { $_ })
-        if ($dirs -and ($dirs | Where-Object { -not $_.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) })) {
-            $root = ($dirs | Sort-Object Length | Select-Object -First 1).TrimEnd('/')
+        $shortest = $null; $mismatch = $false
+        foreach ($it in $items) {
+            $d = [string]$it.FieldValues.FileDirRef
+            if (-not $d) { continue }
+            if (-not $d.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $mismatch = $true }
+            if ($null -eq $shortest -or $d.Length -lt $shortest.Length) { $shortest = $d }
         }
+        if ($mismatch -and $shortest) { $root = $shortest.TrimEnd('/') }
         $n = 0
         foreach ($it in $items) {
             $fv = $it.FieldValues
             if ([int]$fv.FSObjType -ne 0) { continue }
             $size = ConvertTo-SPSTInt64 $fv.SMTotalFileStreamSize
             if ($null -eq $size) { $size = ConvertTo-SPSTInt64 $fv.File_x0020_Size }
-            if ($null -eq $size) { $size = 0 }
+            if ($null -eq $size -or $size -lt 0) { $size = 0 }
             $total = ConvertTo-SPSTInt64 $fv.SMTotalSize
             if ($null -eq $total) { $noSM++; $total = $size }                     # storage metrics not computed yet
-            elseif ($total -lt $size) { $overflow++; $total = $size }            # Int32 LookupId overflow (> 2 GB)
+            elseif ($total -lt $size -or $total -ge [int]::MaxValue) { $overflow++; $total = $size }  # Int32 LookupId overflow (> 2 GB)
             $dir = [string]$fv.FileDirRef
             $folder = if ($dir.Length -gt $root.Length) { $dir.Substring($root.Length).Trim('/') } else { '' }
             $label = [string]$fv._UIVersionString
@@ -105,7 +129,7 @@ function Get-SPSTWebScan {
                 versionCount = Get-SPSTMajorVersion $label
                 versionLabel = $label
                 modified     = ConvertTo-SPSTIso $fv.Modified
-                modifiedBy   = if ($editor -is [Microsoft.SharePoint.Client.FieldUserValue]) { $editor.LookupValue } else { [string]$editor }
+                modifiedBy   = if ($ExcludeUserNames) { '' } elseif ($editor -is [Microsoft.SharePoint.Client.FieldUserValue]) { $editor.LookupValue } else { [string]$editor }
                 created      = ConvertTo-SPSTIso $fv.Created
                 url          = [string]$fv.FileRef
             })
@@ -142,7 +166,9 @@ function Get-SPSTWebScan {
         }
         foreach ($p in $pending) {
             $list = @($p.v | ForEach-Object {
+                # Length is Int64; Size is the older Int32 property
                 $sz = if ($_.PSObject.Properties['Length'] -and $_.Length) { [int64]$_.Length } else { [int64]$_.Size }
+                if ($sz -lt 0) { $sz = 0 }
                 [ordered]@{ label = $_.VersionLabel; size = $sz; created = ConvertTo-SPSTIso $_.Created }
             })
             $files[$p.k].versions = $list
@@ -174,7 +200,7 @@ function Invoke-SPSTSite {
     if ($IncludeSubsites) {
         # Walk the subsite tree with GetSubwebsForCurrentUser (works with AllSites.Read; Web.Webs does not).
         $childUrls = {
-            $c = Get-PnPContext; $s = $c.Web.GetSubwebsForCurrentUser($null); $c.Load($s); $c.ExecuteQuery(); $Opt.State.calls++
+            $c = Get-PnPContext; $s = $c.Web.GetSubwebsForCurrentUser($null); $c.Load($s); Invoke-PnPQuery -RetryCount 5; $Opt.State.calls++
             @($s | ForEach-Object { $_.ServerRelativeUrl })
         }
         $origin = ([uri]$Url).GetLeftPart([UriPartial]::Authority)
@@ -231,34 +257,52 @@ function Get-SPStorageTree {
 
     .EXAMPLE
     Get-SPStorageTree -Tenant contoso -ClientId <app-id> -DeepScan https://contoso.sharepoint.com/sites/Finance
+
+    .NOTES
+    - Read-only: never changes anything in SharePoint.
+    - Changes your current PnP connection (it connects to each site it scans and, after a -Site scan, leaves you
+      connected to that site).
+    - Microsoft 365 commercial cloud (*.sharepoint.com) only.
+    - The report and the generated .html contain file names, paths and (unless -ExcludeUserNames) people's names.
     #>
     [CmdletBinding(DefaultParameterSetName = 'Site')]
     param(
-        [Parameter(Mandatory, ParameterSetName = 'Site', Position = 0)][string]$Site,
+        [Parameter(Mandatory, ParameterSetName = 'Site', Position = 0)]
+        [ValidatePattern('^https://[A-Za-z0-9-]+\.sharepoint\.com(/.*)?$', ErrorMessage = 'Use a full SharePoint Online site URL, e.g. https://contoso.sharepoint.com/sites/ProjectHub')]
+        [string]$Site,
         # tenant name ("contoso") or admin center URL
-        [Parameter(Mandatory, ParameterSetName = 'Tenant')][string]$Tenant,
+        [Parameter(Mandatory, ParameterSetName = 'Tenant')]
+        [ValidatePattern('^([A-Za-z0-9-]+|https://[A-Za-z0-9-]+-admin\.sharepoint\.com/?)$', ErrorMessage = 'Use the tenant name (contoso) or the admin center URL (https://contoso-admin.sharepoint.com)')]
+        [string]$Tenant,
         # tenant mode: sites to scan in detail
-        [Parameter(ParameterSetName = 'Tenant')][string[]]$DeepScan = @(),
+        [Parameter(ParameterSetName = 'Tenant')]
+        [ValidatePattern('^https://[A-Za-z0-9-]+\.sharepoint\.com(/.*)?$', ErrorMessage = 'Use full site URLs, e.g. https://contoso.sharepoint.com/sites/Finance')]
+        [string[]]$DeepScan = @(),
         # tenant mode: also scan the N largest sites in detail
-        [Parameter(ParameterSetName = 'Tenant')][ValidateRange(0, 1000)][int]$Top = 0,
+        [Parameter(ParameterSetName = 'Tenant')][ValidateRange(0, 10000)][int]$Top = 0,
+        [ValidatePattern('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$', ErrorMessage = 'ClientId must be the app registration''s Application (client) ID, a GUID')]
         [string]$ClientId,
-        [string]$Out = 'report.json',
+        [ValidateNotNullOrEmpty()][string]$Out = 'report.json',
         # also scan every subsite (of the site, or of each site scanned in detail)
         [switch]$IncludeSubsites,
         # fetch exact per-version sizes for files with at least this many old versions...
-        [int]$VersionDetailMinVersions = 10,
+        [ValidateRange(1, 1000000)][int]$VersionDetailMinVersions = 10,
         # ...or at least this much version history (MB, estimated from SMTotalSize)
-        [double]$VersionDetailMinHistoryMB = 50,
+        [ValidateRange(0, 1000000)][double]$VersionDetailMinHistoryMB = 50,
         # files per version-detail request
         [ValidateRange(1, 200)][int]$VersionBatchSize = 50,
+        # leave people's names out of the report (modifiedBy, scanning account), e.g. to share it
+        [switch]$ExcludeUserNames,
         [switch]$Pretty,
         # open the report in the viewer when the scan finishes (writes <Out>.html next to the JSON)
         [switch]$Open
     )
     $ErrorActionPreference = 'Stop'
+    $outPath = Resolve-SPSTOutPath $Out          # fail now, not after a long scan
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $state = @{ calls = 0; warnings = [System.Collections.Generic.List[string]]::new() }
-    $opt = @{ State = $state; VersionDetailMinVersions = $VersionDetailMinVersions; VersionDetailMinHistoryMB = $VersionDetailMinHistoryMB; VersionBatchSize = $VersionBatchSize }
+    $opt = @{ State = $state; VersionDetailMinVersions = $VersionDetailMinVersions; VersionDetailMinHistoryMB = $VersionDetailMinHistoryMB
+              VersionBatchSize = $VersionBatchSize; ExcludeUserNames = [bool]$ExcludeUserNames }
     $sitesOut = [System.Collections.Generic.List[object]]::new()
     $scans = [System.Collections.Generic.List[object]]::new()     # every web scanned in detail
     $tenantName = $null; $failed = @()
@@ -332,8 +376,7 @@ function Get-SPStorageTree {
                                versionDetailFiles = [int]($scans | ForEach-Object { $_.versionDetail } | Measure-Object -Sum).Sum
                                warnings = $state.warnings }
     $json = $report | ConvertTo-Json -Depth 8 -Compress:(-not $Pretty)
-    $outPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Out)
-    [IO.File]::WriteAllText($outPath, $json, [Text.UTF8Encoding]::new($false))
+    Write-SPSTFile -Path $outPath -Text $json
     Write-Progress -Activity $script:Activity -Completed
     foreach ($w in $state.warnings) { Write-Warning $w }
 
@@ -386,21 +429,27 @@ function Show-SPStorageTree {
     begin { $all = [System.Collections.Generic.List[string]]::new() }
     process { foreach ($p in $Path) { $all.Add((Resolve-Path -LiteralPath $p).ProviderPath) } }
     end {
-        $viewer = Join-Path $PSScriptRoot 'viewer\storagetree.html'
-        if (-not (Test-Path $viewer)) { throw "Viewer not found at $viewer. Reinstall the module." }
-        $json = @($all | ForEach-Object {
-            $t = [IO.File]::ReadAllText($_).TrimStart([char]0xFEFF)
-            $null = $t | ConvertFrom-Json -ErrorAction Stop   # validate
-            $t
+        $ErrorActionPreference = 'Stop'
+        $viewer = Join-Path (Join-Path $PSScriptRoot 'viewer') 'storagetree.html'
+        if (-not (Test-Path -LiteralPath $viewer)) { throw "Viewer not found at $viewer. Reinstall the module." }
+        $json = @(foreach ($p in $all) {
+            $t = [IO.File]::ReadAllText($p).TrimStart([char]0xFEFF)
+            $o = try { $t | ConvertFrom-Json -Depth 64 } catch { throw "$p is not valid JSON: $($_.Exception.Message)" }
+            if (-not ($o.PSObject.Properties['files'] -or $o.PSObject.Properties['sites'])) { throw "$p is not an SPStorageTree report (no 'files' or 'sites')." }
+            $t.Trim()
         })
         $data = if ($json.Count -eq 1) { $json[0] } else { '[' + ($json -join ',') + ']' }
-        $data = $data -replace '</', '<\/'                    # can't close the script tag early
+        # '<' only appears inside JSON strings, where the JSON escape backslash-u-003c means the same thing.
+        # Replacing it means the data can never close the <script> element or open a comment, whatever the
+        # file names contain. (Built from pieces so no editor or tool can "helpfully" unescape it.)
+        $lt = '\' + 'u' + '003c'
+        $data = $data.Replace([string][char]60, $lt)
         $html = [IO.File]::ReadAllText($viewer)
-        if ($html -notmatch '<!--SPST:DATA-->') { throw 'This viewer version has no data slot.' }
-        $html = $html.Replace('<!--SPST:DATA-->', "<script>window.SPST_REPORT = $data;</script>")
+        if (-not $html.Contains('<!--SPST:DATA-->')) { throw 'This viewer version has no data slot. Reinstall the module.' }
+        $html = $html.Replace('<!--SPST:DATA-->', '<script>window.SPST_REPORT = ' + $data + ';</script>')
         if (-not $OutFile) { $OutFile = [IO.Path]::ChangeExtension($all[0], '.html') }
-        $outPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutFile)
-        [IO.File]::WriteAllText($outPath, $html, [Text.UTF8Encoding]::new($false))
+        $outPath = Resolve-SPSTOutPath $OutFile
+        Write-SPSTFile -Path $outPath -Text $html
         if (-not $NoOpen) { Invoke-Item -LiteralPath $outPath }
         Get-Item -LiteralPath $outPath
     }

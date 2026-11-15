@@ -98,6 +98,7 @@ Or open `storagetree.html` from the module's `viewer` folder and drag one or mor
 | `-VersionDetailMinVersions` | `10` | Fetch exact per-version sizes for files with at least this many old versions... |
 | `-VersionDetailMinHistoryMB` | `50` | ...or at least this much version history. |
 | `-VersionBatchSize` | `50` | Files per version-detail request. |
+| `-ExcludeUserNames` | off | Leave people's names out of the report (to share it more widely). |
 | `-Pretty` | off | Indented JSON. |
 
 ## Who can scan what
@@ -141,6 +142,15 @@ Reports and the generated `.html` contain file names, folder paths, sizes and pe
 
 - Files whose total size (file plus versions) is over 2 GB may come back with a wrong total from SharePoint; the scanner detects this, counts the current size only, and warns.
 - Brand-new or just-changed files may not have storage metrics yet; they're counted at their current size, with a warning.
+
+## Development
+
+```powershell
+./build.ps1                    # copies the viewer into the module, checks the manifest, runs PSScriptAnalyzer
+Invoke-Pester ./tests          # offline tests, no SharePoint needed
+```
+
+CI runs both on Windows and Linux for every push.
 
 ## License
 
