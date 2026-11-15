@@ -766,7 +766,9 @@ function showTip(n, x, y){
     const r = [["Storage used", fmtBytes(n.total)], ["Share of total", fmtPct(n.total, MODEL.root.total)]];
     if (s.template) r.push(["Template", esc(s.template)]);
     if (n.newest) r.push(["Last content change", `${fmtDate(n.newest)} (${fmtAge((MODEL.scanDate - n.newest) / DAY)} ago)`]);
-    tip.innerHTML = `<div class="t">${esc(n.name)}</div><div class="p">${esc(s.url || "")}</div><table>${r.map(x => `<tr><td>${x[0]}</td><td>${x[1]}</td></tr>`).join("")}</table><div class="p" style="margin:6px 0 0">Summary only: this site wasn't scanned in detail, so there's no breakdown by library, file or version. To get one, scan it with <code>-Site</code> or add it to <code>-DeepScan</code>.</div>`;
+    tip.innerHTML = `<div class="t">${esc(n.name)}</div><div class="p">${esc(s.url || "")}</div><table>${r.map(x => `<tr><td>${x[0]}</td><td>${x[1]}</td></tr>`).join("")}</table><div class="p" style="margin:6px 0 0">${s.note
+      ? `⚠ A detailed scan was requested but failed: ${esc(s.note)}. Detailed scans need site collection admin rights on the site.`
+      : `Summary only: this site wasn't scanned in detail, so there's no breakdown by library, file or version. To get one, scan it with <code>-Site</code> or add it to <code>-DeepScan</code>.`}</div>`;
     return placeTip(tip, x, y);
   }
   rows.push(["Storage used", fmtBytes(n.total)], ["Current version", fmtBytes(n.current)], ["Version history", fmtBytes(n.version) + (n.current ? ` (${(n.total / n.current).toFixed(1)}×)` : "")]);
@@ -915,7 +917,7 @@ function renderLevelTable(){
   const showTotal = S.sizeBy !== "total";
   host.innerHTML = `<table class="data"><thead><tr><th>Name</th><th class="num">${lead[0]}</th>${showTotal ? `<th class="num">Storage used</th>` : ""}<th class="num x">Current</th><th class="num">Versions</th><th class="num">Files</th><th class="x">Newest change</th></tr></thead><tbody>${
     shown.map((n, i) => { const ov = n.kind === "ov", d = v => ov ? `<span title="Summary only">–</span>` : v;
-      return `<tr data-i="${i}" ${!isLeaf(n) ? 'tabindex="0"' : ""} title="${esc(n.name)}${ov ? " (summary only)" : ""}"><td><div class="nm">${n.kind === "site" || ov ? "\u{1F310} " : !isLeaf(n) ? "\u{1F4C1} " : ""}${esc(n.name)}${ov ? ` <span class="pt">summary only</span>` : ""}${n.kind === "site" && n.site.partial ? ` <span class="pt">⚠ partial scan</span>` : ""}</div><div class="bar" style="width:${(val(n) / maxV * 100).toFixed(1)}%;background:var(${fillVar(n)})"></div></td><td class="num">${S.sizeBy === "total" || !ov ? fmtBytes(lead[1](n)) : d()}</td>${showTotal ? `<td class="num">${fmtBytes(n.total)}</td>` : ""}<td class="num x">${d(fmtBytes(n.current))}</td><td class="num">${d(fmtBytes(n.version))}</td><td class="num">${d(fmtInt(n.count))}</td><td class="x">${fmtDate(n.newest)}</td></tr>`; }).join("")
+      return `<tr data-i="${i}" ${!isLeaf(n) ? 'tabindex="0"' : ""} title="${esc(n.name)}${ov ? " (summary only)" : ""}"><td><div class="nm">${n.kind === "site" || ov ? "\u{1F310} " : !isLeaf(n) ? "\u{1F4C1} " : ""}${esc(n.name)}${ov ? ` <span class="pt">${n.site.note ? "⚠ couldn't scan in detail" : "summary only"}</span>` : ""}${n.kind === "site" && n.site.partial ? ` <span class="pt">⚠ partial scan</span>` : ""}</div><div class="bar" style="width:${(val(n) / maxV * 100).toFixed(1)}%;background:var(${fillVar(n)})"></div></td><td class="num">${S.sizeBy === "total" || !ov ? fmtBytes(lead[1](n)) : d()}</td>${showTotal ? `<td class="num">${fmtBytes(n.total)}</td>` : ""}<td class="num x">${d(fmtBytes(n.current))}</td><td class="num">${d(fmtBytes(n.version))}</td><td class="num">${d(fmtInt(n.count))}</td><td class="x">${fmtDate(n.newest)}</td></tr>`; }).join("")
   }</tbody></table>${kids.length > MAX_ROWS ? `<div class="more">Showing ${MAX_ROWS} of ${fmtInt(kids.length)}.</div>` : ""}`;
   host.scrollTop = 0;
   ROW_OF = new Map(); HL = null;
@@ -1019,6 +1021,8 @@ function load(input, sample){
   if (sample) parts.push(`<b>Sample data.</b> This is ${SAMPLE_TEXT[sample]}. To see your own, run <code>Get-SPStorageTree -Site &lt;url&gt; -Out report.json</code> (add <code>-IncludeSubsites</code>, or use <code>-Tenant</code>), then drop report.json on this page or click <b>Load report.json</b>. You can drop several reports at once.`);
   if (list.length > 1) parts.push(`<b>${fmtInt(list.length)} reports combined.</b> Where a site appears in more than one, the newest scan is used.`);
   if (M.partial.length) parts.push(`<b>⚠ Partial scan:</b> ${M.partial.map(s => esc(s.title || s.url)).join(", ")} ${M.partial.length === 1 ? "was" : "were"} scanned by an account that isn't a site collection admin. Libraries that account can't open are missing, and the site's total storage couldn't be read. For a complete picture, scan as a site collection admin.${M.partial.some(s => s.partialReason) ? ` (${M.partial.map(s => s.partialReason).filter(Boolean).map(esc).join("; ")})` : ""}`);
+  const failed = M.ovSites.filter(n => n.site.note);
+  if (failed.length) parts.push(`<b>⚠ ${fmtInt(failed.length)} site${failed.length === 1 ? "" : "s"} couldn't be scanned in detail</b> and ${failed.length === 1 ? "is" : "are"} shown as summary only: ${failed.slice(0, 5).map(n => esc(n.name)).join(", ")}${failed.length > 5 ? ` and ${fmtInt(failed.length - 5)} more` : ""}. Detailed scans need site collection admin rights on each site.`);
   const bn = $("#banner");
   bn.hidden = !parts.length;
   bn.innerHTML = parts.map(p => `<div>${p}</div>`).join(`<div style="height:6px"></div>`);
