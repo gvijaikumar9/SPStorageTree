@@ -1049,6 +1049,7 @@ $("#btnTheme").onclick = () => {
   try { localStorage.setItem("spst-theme", document.documentElement.dataset.theme); } catch {}
 };
 try { const t = localStorage.getItem("spst-theme"); if (t) document.documentElement.dataset.theme = t; } catch {}
+{ const t = /theme=(light|dark)/.exec(location.hash); if (t) document.documentElement.dataset.theme = t[1]; } // test link, not saved
 $("#btnLoad").onclick = () => $("#file").click();
 $("#optSample").onchange = e => { if (e.target.value) load(makeSample(e.target.value), e.target.value); };
 async function readFiles(fileList){

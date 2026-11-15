@@ -6,6 +6,10 @@
 - **Local.** The scan writes a JSON report on your machine. The viewer is one HTML file with no dependencies that runs offline in your browser. Nothing is uploaded anywhere.
 - **One site, a site with its subsites, or the whole tenant.**
 
+![Treemap of a SharePoint site with a contents table beside it](docs/treemap-light.png)
+
+*All screenshots use the viewer's built-in sample data (a made-up "contoso" tenant).*
+
 ## What you get
 
 | View | Answers |
@@ -17,6 +21,18 @@
 | **Copilot readiness** | Stale or ROT documents in formats Copilot can read, which can show up in answers as if they were current. |
 
 Every table exports to CSV.
+
+**What-if: keep the latest 25 versions.** The curve shows how much each limit gets back; the tables show which libraries and files gain most.
+
+![Version history what-if with reclaim curve, per-library and per-file tables](docs/whatif-light.png)
+
+**Tenant mode** (dark theme). Sites scanned in detail open into libraries and folders; the rest show as striped summary tiles with their storage total.
+
+![Tenant treemap with detailed and summary-only sites](docs/tenant-dark.png)
+
+**Copilot readiness.** Stale, duplicate and copied documents in formats Copilot reads, with the reason for each.
+
+![Copilot readiness table with reasons per file](docs/copilot-light.png)
 
 ## Requirements
 
