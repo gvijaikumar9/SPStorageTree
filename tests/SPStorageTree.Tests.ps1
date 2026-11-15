@@ -102,6 +102,24 @@ Describe 'Code safety' {
         }
         $hits | Should -BeNullOrEmpty
     }
+    It 'no function uses two variables whose names differ only by case' {
+        # e.g. 'foreach ($s in ...)' inside a function that keeps its state in '$S' replaces the state.
+        $auto = 'true', 'false', 'null', '_', 'args', 'this', 'input', 'psitem', 'error', 'matches', 'host', 'home', 'pwd', 'env'
+        $files = Get-ChildItem $ModuleDir | Where-Object Extension -in '.psm1', '.ps1'
+        $hits = foreach ($file in $files) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+            foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+                $fn.Body.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) |
+                    Where-Object { -not $_.VariablePath.DriveName } |
+                    ForEach-Object { $_.VariablePath.UserPath -replace '^(script|global|local|private):', '' } |
+                    Where-Object { $_ -notin $auto } |
+                    Group-Object { $_.ToLowerInvariant() } |
+                    Where-Object { @($_.Group | Sort-Object -Unique -CaseSensitive).Count -gt 1 } |
+                    ForEach-Object { "$($fn.Name): " + (@($_.Group | Sort-Object -Unique -CaseSensitive) -join ' / ') }
+            }
+        }
+        $hits | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Get-SPStorageTree input validation (no network)' {

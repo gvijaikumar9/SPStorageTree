@@ -216,7 +216,13 @@ function Start-SPStorageTree {
             if (-not $err -and $ps.Streams.Error.Count) { $err = ($ps.Streams.Error | ForEach-Object { $_.Exception.Message } | Select-Object -Unique) -join "`n" }
             $S.handle = $null
             & $setBusy $false
-            & $S.task.onDone $out $err
+            # never let a UI bug take the window down: log it and tell the user instead
+            try { & $S.task.onDone $out $err }
+            catch {
+                & $log "Internal error: $($_.Exception.Message)"
+                $lStatus.Text = 'Something went wrong. See the message log below.'
+                & $msg "Something went wrong in SharePoint Storage Tree:`n`n$($_.Exception.Message)`n`nPlease report it at https://github.com/gvijaikumar9/SPStorageTree/issues" 'Error'
+            }
         }
     })
     $timer.Start()
@@ -236,7 +242,7 @@ function Start-SPStorageTree {
                 return
             }
             $table.Rows.Clear()
-            foreach ($s in $out) { [void]$table.Rows.Add($false, $s.Title, $s.SizeMB, $s.Url, $(if ($s.LastChange) { [datetime]$s.LastChange } else { [DBNull]::Value })) }
+            foreach ($site in $out) { [void]$table.Rows.Add($false, $site.Title, $site.SizeMB, $site.Url, $(if ($site.LastChange) { [datetime]$site.LastChange } else { [DBNull]::Value })) }
             $S.signedIn = $true; $rTenant.Enabled = $true
             $grid.Columns['Size (MB)'].DefaultCellStyle.Format = 'N0'; $grid.Columns['Size (MB)'].DefaultCellStyle.Alignment = 'MiddleRight'
             $grid.Columns['Scan'].FillWeight = 12; $grid.Columns['Size (MB)'].FillWeight = 22; $grid.Columns['Last change'].FillWeight = 30
