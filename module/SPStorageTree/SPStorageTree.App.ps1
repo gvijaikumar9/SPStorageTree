@@ -81,7 +81,7 @@ function Invoke-SPSTBatch {
             }
         }
     }
-    if (-not $reports.Count) { throw 'Nothing was scanned. See the messages above.' }
+    if (-not $reports.Count) { throw 'Nothing was scanned. The reasons are in the message log at the bottom of the window.' }
     $Sync.overall = 'Opening the viewer'
     $html = Show-SPStorageTree -Path $reports -OutFile (Join-Path $OutDir "storage-$ts.html") -NoOpen:$NoOpen
     [pscustomobject]@{ Html = $html.FullName; Reports = @($reports); Failed = @($failed); OutDir = $OutDir }
