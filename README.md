@@ -33,10 +33,23 @@ Install-PSResource SPStorageTree     # also installs PnP.PowerShell
 Since September 2024, PnP PowerShell can't sign in without your tenant's own app registration (Microsoft retired the shared one). If your tenant already has one for PnP PowerShell, use its Client ID. If not, someone who can grant admin consent runs:
 
 ```powershell
-Register-PnPEntraIDAppForInteractiveLogin -ApplicationName "SharePoint Storage Tree" -Tenant contoso.onmicrosoft.com
+# site and subsite scans only: read-only is enough
+Register-PnPEntraIDAppForInteractiveLogin -ApplicationName "SharePoint Storage Tree" -Tenant contoso.onmicrosoft.com -SharePointDelegatePermissions AllSites.Read
+
+# also tenant mode
+Register-PnPEntraIDAppForInteractiveLogin -ApplicationName "SharePoint Storage Tree (admin)" -Tenant contoso.onmicrosoft.com -SharePointDelegatePermissions AllSites.FullControl
 ```
 
 and shares the Client ID it prints. Everyone then signs in with their own account through that app.
+
+### Permissions (delegated, SharePoint)
+
+| Scan | Minimum app permission | Tested |
+|---|---|---|
+| `-Site`, `-Site -IncludeSubsites` | **AllSites.Read** | Same result as AllSites.FullControl, file for file. |
+| `-Tenant` (the site list) | **AllSites.FullControl** | AllSites.Read and AllSites.Manage are refused by the admin API. |
+
+These are delegated permissions: the app can never do more than the signed-in person can. The tool only reads, whichever permission the app has. If your organization doesn't want a FullControl app, use a read-only app and run `-Site` scans per site instead of `-Tenant`.
 
 ## Scan
 

@@ -42,16 +42,26 @@ function Get-SPSTWebScan {
     Write-Progress -Activity $script:Activity -Status "$($Label): reading site"
     $web = Get-PnPWeb -Includes Title, Url, LastItemUserModifiedDate, CurrentUser; $State.calls++
     $partialReasons = @()
-    if (-not $web.CurrentUser.IsSiteAdmin) { $partialReasons += "scanned as $($web.CurrentUser.Email), who is not a site collection admin" }
+    # Site usage is only readable by site collection admins, so it doubles as the "full scan?" check.
+    # (CurrentUser.IsSiteAdmin can't be used: with a read-only app registration it is always false.)
     $storageUsed = $null
-    if ($IsTop) {
-        try { $storageUsed = [int64](Get-PnPSite -Includes Usage).Usage.Storage; $State.calls++ }
-        catch { $partialReasons += 'site total storage not readable'; $warnings.Add("Site usage: $($_.Exception.Message)") }
+    try { $usage = [int64](Get-PnPSite -Includes Usage).Usage.Storage; $State.calls++; if ($IsTop) { $storageUsed = $usage } }
+    catch {
+        $partialReasons += "scanned as $($web.CurrentUser.Email), who is not a site collection admin (site total not readable; libraries with their own permissions may be missing)"
+        $warnings.Add("$($Label): site usage not readable ($($_.Exception.Message)). Scan as a site collection admin for a complete report.")
     }
 
     # ---- libraries (all document libraries, including hidden/system ones) ----------------------
-    $lists = @(Get-PnPList -Includes RootFolder, BaseTemplate, Hidden, ItemCount | Where-Object { $_.BaseType -eq 'DocumentLibrary' }); $State.calls++
-    $holdLib = $lists | Where-Object { $_.RootFolder.ServerRelativeUrl -match '/PreservationHoldLibrary$' -or $_.Title -eq 'Preservation Hold Library' }
+    # Root folder path comes from DefaultViewUrl: asking for RootFolder on every list needs more than AllSites.Read.
+    $lists = @(Get-PnPList -Includes DefaultViewUrl, BaseTemplate, Hidden, ItemCount | Where-Object { $_.BaseType -eq 'DocumentLibrary' }); $State.calls++
+    $libRoot = {
+        param($l)
+        $u = [string]$l.DefaultViewUrl
+        if ($u -match '^(.*?)/Forms/[^/]+$') { return $Matches[1] }
+        if ($u -match '^(.*)/[^/]+\.aspx$') { return $Matches[1] }
+        $u.TrimEnd('/')
+    }
+    $holdLib = $lists | Where-Object { (& $libRoot $_) -match '/PreservationHoldLibrary$' -or $_.Title -eq 'Preservation Hold Library' }
 
     $fields = 'FileLeafRef', 'FileRef', 'FileDirRef', 'FSObjType', 'File_x0020_Size', 'SMTotalSize', 'SMTotalFileStreamSize', '_UIVersionString', 'Modified', 'Created', 'Editor'
     $files = [System.Collections.Generic.List[object]]::new()
@@ -61,11 +71,16 @@ function Get-SPSTWebScan {
     foreach ($l in $lists) {
         $i++
         Write-Progress -Activity $script:Activity -Status "$($Label): library $i of $($lists.Count) ($($l.Title))" -PercentComplete ($i / $lists.Count * 60)
-        $root = $l.RootFolder.ServerRelativeUrl.TrimEnd('/')
+        $root = & $libRoot $l
         $items = @()
         if ($l.ItemCount -gt 0) {
             try { $items = @(Get-PnPListItem -List $l -PageSize 5000 -Fields $fields); $State.calls += [math]::Max(1, [math]::Ceiling($l.ItemCount / 5000)) }
             catch { $warnings.Add("$($Label): library '$($l.Title)': $($_.Exception.Message)"); $partialReasons += "library '$($l.Title)' not readable"; continue }
+        }
+        # safety net: if the view URL didn't give the real root, use the shortest folder the items live in
+        $dirs = @($items | ForEach-Object { [string]$_.FieldValues.FileDirRef } | Where-Object { $_ })
+        if ($dirs -and ($dirs | Where-Object { -not $_.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) })) {
+            $root = ($dirs | Sort-Object Length | Select-Object -First 1).TrimEnd('/')
         }
         $n = 0
         foreach ($it in $items) {
@@ -157,22 +172,30 @@ function Invoke-SPSTSite {
     $top = Get-SPSTWebScan @Opt -IsTop -Label $Label
     $results.Add($top)
     if ($IncludeSubsites) {
-        $subs = @(Get-PnPSubWeb -Recurse -Includes Title); $Opt.State.calls++
+        # Walk the subsite tree with GetSubwebsForCurrentUser (works with AllSites.Read; Web.Webs does not).
+        $childUrls = {
+            $c = Get-PnPContext; $s = $c.Web.GetSubwebsForCurrentUser($null); $c.Load($s); $c.ExecuteQuery(); $Opt.State.calls++
+            @($s | ForEach-Object { $_.ServerRelativeUrl })
+        }
+        $origin = ([uri]$Url).GetLeftPart([UriPartial]::Authority)
+        $queue = [System.Collections.Generic.Queue[string]]::new()
+        try { & $childUrls | ForEach-Object { $queue.Enqueue($origin + $_) } }
+        catch { $Opt.State.warnings.Add("Subsites of $Url not listed: $($_.Exception.Message)") }
         $n = 0
-        foreach ($sub in $subs) {
-            $n++
-            $u = $sub.Url.TrimEnd('/')
+        while ($queue.Count) {
+            $u = $queue.Dequeue().TrimEnd('/'); $n++
             try {
                 if (-not $ClientId) { throw 'subsites need -ClientId (or a connection made with -ClientId) to sign in to each subsite' }
                 Connect-PnPOnline -Url $u -Interactive -ClientId $ClientId
-                $results.Add((Get-SPSTWebScan @Opt -ParentUrl $u.Substring(0, $u.LastIndexOf('/')) -Label "$Label, subsite $n of $($subs.Count)"))
+                $results.Add((Get-SPSTWebScan @Opt -ParentUrl $u.Substring(0, $u.LastIndexOf('/')) -Label "$Label, subsite $n"))
+                & $childUrls | ForEach-Object { $queue.Enqueue($origin + $_) }
             } catch {
                 $Opt.State.warnings.Add("Subsite $u not scanned: $($_.Exception.Message)")
                 $top.site.partial = $true
                 $top.site.partialReason = (@($top.site.partialReason, "subsite $u not readable") | Where-Object { $_ }) -join '; '
             }
         }
-        if ($subs) { Connect-PnPOnline -Url $Url -Interactive -ClientId $ClientId }
+        if ($n) { Connect-PnPOnline -Url $Url -Interactive -ClientId $ClientId }
     }
     @{ results = $results; top = $top }
 }
@@ -193,6 +216,8 @@ function Get-SPStorageTree {
     Register-PnPEntraIDAppForInteractiveLogin), or, in -Site mode, connect first with Connect-PnPOnline.
     Site mode works best as a site collection admin. Tenant mode needs a SharePoint Administrator; detailed
     scans still need site collection admin rights on each chosen site (an admin role alone can't read content).
+    App permission (delegated SharePoint): AllSites.Read is enough for -Site and -IncludeSubsites;
+    -Tenant needs AllSites.FullControl (the admin site list refuses Read and Manage).
 
     .EXAMPLE
     Get-SPStorageTree -Site https://contoso.sharepoint.com/sites/ProjectHub -ClientId <app-id>
