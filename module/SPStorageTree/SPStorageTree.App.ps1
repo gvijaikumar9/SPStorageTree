@@ -21,7 +21,8 @@ function Get-SPSTSiteList {
             Title      = if ($_.Title) { $_.Title } else { $_.Url }
             SizeMB     = [double]$_.StorageUsageCurrent
             Url        = $_.Url.TrimEnd('/')
-            LastChange = $_.LastContentModifiedDate
+            # the tenant API returns UTC (often with Kind Unspecified); show it in the user's local time
+            LastChange = if ($_.LastContentModifiedDate) { [datetime]::SpecifyKind([datetime]$_.LastContentModifiedDate, 'Utc').ToLocalTime() } else { $null }
             Template   = $_.Template
         }
     })
