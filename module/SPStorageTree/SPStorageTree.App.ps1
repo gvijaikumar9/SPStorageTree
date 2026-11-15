@@ -128,7 +128,7 @@ function Start-SPStorageTree {
     $nTop = Add-Ctl NumericUpDown @{ Location = '0,98'; Width = 55; Minimum = 0; Maximum = 1000; Value = 3; Enabled = $false }
     $lTop = Add-Ctl Label @{ Text = 'in detail'; Location = '0,101'; AutoSize = $true }; $nTop.Left = $rTenant.Right + 2; $lTop.Left = $nTop.Right + 6
 
-    $tFilter = Add-Ctl TextBox @{ Location = '16,130'; Width = 260; PlaceholderText = 'Filter sites by name or URL' }
+    $tFilter = Add-Ctl TextBox @{ Location = '16,130'; Width = 260; PlaceholderText = 'Filter the list (type part of a name)' }
     $bAll = Add-Ctl Button @{ Text = 'Tick all'; Location = '288,128'; Width = 80 }
     $bNone = Add-Ctl Button @{ Text = 'Tick none'; Location = '374,128'; Width = 80 }
     $lCount = Add-Ctl Label @{ Text = ''; Location = '466,132'; AutoSize = $true; ForeColor = [System.Drawing.Color]::DimGray }
@@ -175,7 +175,10 @@ function Start-SPStorageTree {
     }
     $updateCount = {
         $n = @($table.Rows | Where-Object { $_['Scan'] }).Count
-        $lCount.Text = if ($table.Rows.Count) { "$n of $($table.Rows.Count) sites ticked" } else { '' }
+        $shown = $table.DefaultView.Count
+        $lCount.Text = if (-not $table.Rows.Count) { '' }
+                       elseif ($shown -lt $table.Rows.Count) { "$n of $($table.Rows.Count) sites ticked  |  $shown shown by the filter" }
+                       else { "$n of $($table.Rows.Count) sites ticked" }
     }
     $setBusy = {
         param([bool]$b)
@@ -263,6 +266,7 @@ function Start-SPStorageTree {
     $tFilter.Add_TextChanged({
         $q = $tFilter.Text.Trim() -replace "'", "''" -replace '([\[\]%*])', '[$1]'
         $table.DefaultView.RowFilter = if ($q) { "Site LIKE '%$q%' OR URL LIKE '%$q%'" } else { '' }
+        & $updateCount
     })
     $bAll.Add_Click({ foreach ($r in $table.DefaultView) { $r['Scan'] = $true }; & $updateCount })
     $bNone.Add_Click({ foreach ($r in $table.Rows) { $r['Scan'] = $false }; & $updateCount })
@@ -281,6 +285,13 @@ function Start-SPStorageTree {
         if (-not (& $guidOk)) { & $msg 'Enter the Application (client) ID of your PnP PowerShell app registration (a GUID).'; return }
         $ticked = @($table.Rows | Where-Object { $_['Scan'] } | ForEach-Object { [string]$_['URL'] })
         $pasted = @($tUrls.Lines | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        # a site URL typed into the filter box (easy mistake): offer to scan it
+        $fq = $tFilter.Text.Trim()
+        if (-not $ticked -and -not $pasted -and $rSites.Checked -and $fq -match '^https://[A-Za-z0-9-]+\.sharepoint\.com(/.*)?$') {
+            $ans = [System.Windows.Forms.MessageBox]::Show($f, "That URL is in the filter box, which only filters the list.`n`nScan this site?`n`n$fq", 'SharePoint Storage Tree', 'YesNo', 'Question')
+            if ($ans -ne 'Yes') { return }
+            $tUrls.Text = $fq; $tFilter.Text = ''; $pasted = @($fq)
+        }
         $bad = @($pasted | Where-Object { $_ -notmatch '^https://[A-Za-z0-9-]+\.sharepoint\.com(/.*)?$' })
         if ($bad) { & $msg "These don't look like SharePoint Online site URLs:`n`n$($bad -join "`n")"; return }
         $out = $tOut.Text.Trim(); if (-not $out) { & $msg 'Choose a folder for the reports.'; return }
