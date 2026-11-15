@@ -69,11 +69,15 @@ These are delegated permissions: the app can never do more than the signed-in pe
 
 ## Windows app
 
-Prefer clicking to typing? Run **`Start-SPStorageTree`**, or double-click **`SPStorageTree.exe`** in the module folder (also attached to each [GitHub release](https://github.com/gvijaikumar9/SPStorageTree/releases)).
+Prefer clicking to typing? Run **`Start-SPStorageTree`**, or double-click **`SPStorageTree.exe`** in the module folder. You can also [download the latest SPStorageTree.exe](https://github.com/gvijaikumar9/SPStorageTree/releases/latest/download/SPStorageTree.exe) and keep it anywhere; it opens the installed module.
 
 1. Enter your tenant name and the app's Client ID.
-2. **SharePoint admins:** click **Sign in and list sites** to get every site with its size, then tick the ones to scan, or choose **Whole tenant**. **Everyone else:** paste the URLs of sites you own.
+2. **SharePoint admins:** click **Sign in and list sites** to get every site with its size, then select the ones to scan (the checkbox in the column header selects all), or choose **Whole tenant**. **Everyone else:** paste the URLs of sites you own.
 3. Click **Scan**. When it finishes, the viewer opens with all the chosen sites in one view. Reports are saved in **Documents\SPStorageTree** (or the folder you pick).
+
+![The SharePoint Storage Tree window after signing in: a list of the tenant's sites with their sizes, three selected, and the Scan button](docs/app-ready.png)
+
+![The window during a scan: a progress bar, the site and library being read, and the message log](docs/app-scanning.png)
 
 The exe is a small launcher: it still needs PowerShell 7.4+ and PnP.PowerShell, and tells you the one command to run if either is missing. It isn't code-signed, so the first time Windows may show **Windows protected your PC**: choose **More info** > **Run anyway**.
 

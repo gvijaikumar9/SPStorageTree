@@ -211,6 +211,7 @@ function Start-SPStorageTree {
             }
         }
     }
+    $fmtMB = { param($mb) if ($mb -ge 1024) { '{0:N1} GB' -f ($mb / 1024) } else { '{0:N0} MB' -f $mb } }
     $updateCount = {
         $n = @($table.Rows | Where-Object { $_['Scan'] }).Count
         $shown = $table.DefaultView.Count
@@ -298,7 +299,7 @@ function Start-SPStorageTree {
             $S.signedIn = $true; $rTenant.Enabled = $true
             & $setupGrid
             $total = ($out | Measure-Object SizeMB -Sum).Sum
-            $lStatus.Text = "Signed in. $($out.Count) sites, $('{0:N0}' -f $total) MB in total. Select the sites to scan."
+            $lStatus.Text = "Signed in. $($out.Count) sites, $(& $fmtMB $total) in total. Select the sites to scan."
             & $log "Listed $($out.Count) sites."
             & $updateCount
         } 'Signing in: finish the sign-in in your browser (if it asks which account, pick your admin account)'
@@ -370,17 +371,36 @@ function Start-SPStorageTree {
     })
 
     if ($env:SPST_APP_SCREENSHOT) {
-        # test hook: render the window to a PNG without user interaction, then close
+        # test/docs hook: fill the window with made-up contoso data, render it to a PNG, then close.
+        # SPST_APP_SCREENSHOT_STATE = 'ready' (default) or 'scanning'. Never shows real tenant data or local paths.
         $f.Add_Shown({
-            foreach ($row in @(@($true, 'Intranet Demo', 140, 'https://contoso.sharepoint.com/sites/intranet-demo', [datetime]'2026-11-03'),
-                               @($false, 'List Dashboard Demo', 11, 'https://contoso.sharepoint.com/sites/listdash', [datetime]'2026-11-11'),
-                               @($true, 'PowerShell Demo', 2, 'https://contoso.sharepoint.com/sites/PSDemo', [datetime]'2026-11-15'))) { [void]$table.Rows.Add($row) }
-            $S.signedIn = $true; $rTenant.Enabled = $true; $tTenant.Text = 'contoso'; $tClient.Text = '00000000-0000-0000-0000-000000000000'
-            & $setupGrid
-            & $updateCount; $lStatus.Text = 'Signed in. 3 sites, 153 MB in total. Select the sites to scan.'
+            $demo = @(
+                @('Archive 2018', 123904, 'Archive2018', '2020-03-14 09:12', $false), @('Design Studio', 86016, 'DesignStudio', '2026-10-27 16:40', $false),
+                @('Product Engineering', 47104, 'ProductEngineering', '2026-11-14 11:05', $false), @('Finance', 38912, 'Finance', '2026-11-11 08:31', $false),
+                @('Marketing', 32051, 'Marketing', '2026-11-13 15:22', $true), @('Project Hub', 30618, 'ProjectHub', '2026-11-14 09:58', $true),
+                @('Learning & Development', 27648, 'LearningDevelopment', '2026-09-30 13:47', $false), @('IT Service Desk', 23552, 'ITServiceDesk', '2026-11-13 17:03', $false),
+                @('Project Apollo', 19456, 'ProjectApollo', '2025-02-18 10:20', $false), @('Sales Team', 17408, 'SalesTeam', '2026-11-08 12:15', $false),
+                @('Communications', 13312, 'Communications', '2026-11-12 14:36', $false), @('HR Hub', 11264, 'HRHub', '2026-11-05 09:09', $false),
+                @('Customer Success', 9728, 'CustomerSuccess', '2026-11-02 16:58', $false), @('Legal Archive', 5120, 'LegalArchive', '2022-06-01 08:00', $true))
+            foreach ($d in $demo) { [void]$table.Rows.Add($d[4], $d[0], $d[1], "https://contoso.sharepoint.com/sites/$($d[2])", [datetime]$d[3]) }
+            $S.signedIn = $true; $rTenant.Enabled = $true
+            $tTenant.Text = 'contoso'; $tClient.Text = '00000000-0000-0000-0000-000000000000'; $tOut.Text = 'C:\Users\you\Documents\SPStorageTree'
+            & $setupGrid; & $updateCount
+            $grid.ClearSelection(); $grid.CurrentCell = $null
+            $total = ($demo | ForEach-Object { $_[1] } | Measure-Object -Sum).Sum
+            if ($env:SPST_APP_SCREENSHOT_STATE -eq 'scanning') {
+                & $setBusy $true
+                $bar.Style = 'Blocks'; $bar.Value = 46; $bar.Value = 45   # going down skips the fill animation
+                $lStatus.Text = 'Site 2 of 3: https://contoso.sharepoint.com/sites/Marketing  |  site: library 4 of 9 (Marketing Media)   (38 s)'
+                $tLog.Text = "[10:41:02] Signing in: finish the sign-in in your browser (if it asks which account, pick your admin account)...`r`n" +
+                             "[10:41:09] Listed 14 sites.`r`n[10:41:31] Scanning 3 site(s). If a browser window opens, finish the sign-in there...`r`n"
+            } else {
+                $lStatus.Text = "Signed in. $($demo.Count) sites, $(& $fmtMB $total) in total. Select the sites to scan."
+                $tLog.Text = "[10:41:02] Signing in: finish the sign-in in your browser (if it asks which account, pick your admin account)...`r`n[10:41:09] Listed $($demo.Count) sites.`r`n"
+            }
             $f.Refresh(); [System.Windows.Forms.Application]::DoEvents()
             $bmp = [System.Drawing.Bitmap]::new($f.Width, $f.Height); $f.DrawToBitmap($bmp, [System.Drawing.Rectangle]::new(0, 0, $f.Width, $f.Height))
-            $bmp.Save($env:SPST_APP_SCREENSHOT); $bmp.Dispose(); $f.Close()
+            $bmp.Save($env:SPST_APP_SCREENSHOT); $bmp.Dispose(); $S.busy = $false; $f.Close()
         })
     }
     [void]$f.ShowDialog()
