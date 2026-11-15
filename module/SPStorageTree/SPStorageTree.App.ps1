@@ -28,6 +28,13 @@ function Get-SPSTSiteList {
     })
 }
 
+function Get-SPSTBatchResult {
+    # The batch result from a background job's output (or $null). PowerShell 7 runs Where-Object once even
+    # when the input is $null, so null items must be guarded before touching .PSObject.
+    param($Output)
+    @($Output | Where-Object { $null -ne $_ -and $_.PSObject.Properties['Html'] }) | Select-Object -Last 1
+}
+
 function Invoke-SPSTBatch {
     # Runs one scan job for the app: several sites (one report each, combined in the viewer) or the tenant.
     param(
@@ -308,7 +315,7 @@ function Start-SPStorageTree {
         $what += '. If a browser window opens, finish the sign-in there'
         & $runBg 'param($a) $a.Sync = $SPSTSync; & (Get-Module SPStorageTree) { param($a) Invoke-SPSTBatch @a } $a' $a {
             param($out, $err)
-            $r = @($out | Where-Object { $_.PSObject.Properties['Html'] }) | Select-Object -Last 1
+            $r = Get-SPSTBatchResult $out
             if ($err -or -not $r -or $r.Failed.Count) { & $toFront }   # only jump in front of the viewer when there's something to read
             if ($err -and -not $r) {
                 $lStatus.Text = 'Scan stopped.'; & $log "Error: $err"

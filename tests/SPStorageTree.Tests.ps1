@@ -83,6 +83,24 @@ Describe 'Helpers' {
     }
 }
 
+Describe 'App result handling' {
+    It 'copes with <Name> from a background job' -TestCases @(
+        @{ Name = 'no output ($null)'; Kind = 'null' }
+        @{ Name = 'an empty list'; Kind = 'empty' }
+        @{ Name = 'nulls mixed with other output'; Kind = 'mixed' }
+    ) {
+        param($Name, $Kind)
+        InModuleScope SPStorageTree -Parameters @{ Kind = $Kind } {
+            param($Kind)
+            $res = [pscustomobject]@{ Html = 'C:\x.html'; Reports = @('a.json'); Failed = @(); OutDir = 'C:\' }
+            $in = switch ($Kind) { 'null' { $null } 'empty' { @() } 'mixed' { @($null, 'text', $null, $res, $null) } }
+            { Get-SPSTBatchResult $in } | Should -Not -Throw
+            $r = Get-SPSTBatchResult $in
+            if ($Kind -eq 'mixed') { $r.Html | Should -Be 'C:\x.html' } else { $r | Should -BeNullOrEmpty }
+        }
+    }
+}
+
 Describe 'Code safety' {
     It 'no function reassigns one of its own parameters under a different case' {
         # PowerShell variable names ignore case: '$label = ...' silently overwrites a '$Label' parameter.
