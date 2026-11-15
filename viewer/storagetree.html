@@ -1,0 +1,1483 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SharePoint Storage Tree</title>
+<!--
+  SharePoint Storage Tree - offline viewer (prototype)
+  Single file, no dependencies, no network. Open directly from disk.
+
+  Report schema v1 (what Get-SPStorageTree must emit):
+  {
+    "schemaVersion": "1.0",
+    "generator": { "name": "SPStorageTree", "version": "0.1.0" },
+    "scannedAt": "2026-11-14T10:00:00Z",
+    "site": { "url": "https://contoso.sharepoint.com/sites/x", "title": "X",
+              "storageUsed": 146658892 },  // optional: Get-PnPSite -Includes Usage -> Usage.Storage (bytes).
+                                           // Anything not covered by files shows as "Other (system, list overhead)".
+    "libraries": [ { "title": "Documents", "url": "/sites/x/Shared Documents", "itemCount": 120 } ],
+    "files": [ {
+      "library": "Documents",          // library title (matches libraries[].title)
+      "folder": "Projects/Alpha",      // path inside the library, "" = root
+      "name": "Plan.docx",
+      "size": 123456,                  // current version, bytes  (SMTotalFileStreamSize)
+      "totalSize": 987654,             // everything the file costs (SMTotalSize): current + old versions
+                                       // + overhead (metadata, renditions). Overhead is NOT reclaimable.
+      "versionCount": 12,              // from _UIVersionString major (approximate where minor versions exist)
+      "modified": "2025-01-02T03:04:05Z",
+      "modifiedBy": "Alex Wilber",
+      "created": "2024-06-01T00:00:00Z",
+      "url": "/sites/x/Shared Documents/Projects/Alpha/Plan.docx",  // optional
+      "versions": [                    // optional: OLD versions only (not the current one), any order.
+        { "label": "1.0", "size": 90000, "created": "2024-06-01T00:00:00Z" }
+      ]                                // Scanner fills this for files with real history (e.g. >10 versions
+                                       // or >50 MB history); the viewer estimates the rest.
+  Split of (totalSize - size): with versions[] -> history = sum(versions), overhead = the rest (exact).
+  Without -> versionCount 1 means history 0 (all overhead); otherwise history is estimated as
+  min(totalSize - size, old versions x current size) and anything above that counts as overhead.
+
+  Report schema v1.1 (all scan modes; v1.0 above still loads as a single site):
+  {
+    "schemaVersion": "1.1", "generator": {...}, "scannedAt": "...",
+    "scope": "site" | "subsites" | "tenant",
+    "tenant": "contoso",                       // optional, tenant mode
+    "sites": [ {
+      "url": "https://contoso.sharepoint.com/sites/x", "title": "X",
+      "parentUrl": "https://.../sites/x",      // subsites only: the parent web
+      "template": "GROUP#0",                   // optional
+      "storageUsed": 146658892,                // bytes. Site collection total (includes subsites), so set it on
+                                               // the top web only. Tenant overview: StorageUsageCurrent MB x 1048576.
+      "lastModified": "2026-11-03T14:05:44Z",  // optional (LastContentModifiedDate)
+      "deep": true,                            // false = overview only: no libraries/files
+      "partial": true, "partialReason": "...", // scanned by a non-admin: libraries/site total may be missing
+      "libraries": [ ... as v1.0 ... ],
+      "files": [ ... as v1.0 ... ]
+    } ]
+  }
+  Several reports dropped together are merged by site url (newest scan wins).
+    } ]
+  }
+-->
+<style>
+:root{
+  color-scheme: light;
+  --page:#f9f9f7; --surface-1:#fcfcfb; --surface-2:#f0efec; --surface-3:#e9e8e3;
+  --text-primary:#0b0b0b; --text-secondary:#52514e; --text-muted:#898781;
+  --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,.10);
+  --accent:#2a78d6;
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s5:#e87ba4; --s6:#008300; --s7:#6250d6; --other:#a9a79f;
+  --q1:#b7d3f6; --q2:#86b6ef; --q3:#3987e5; --q4:#1c5cab; --q5:#0d366b;
+  --good:#0ca30c; --warning:#fab219; --serious:#ec835a; --critical:#d03b3b;
+  --shadow:0 6px 24px rgba(0,0,0,.12);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --page:#0d0d0d; --surface-1:#1a1a19; --surface-2:#232321; --surface-3:#2c2c2a;
+    --text-primary:#f0efec; --text-secondary:#c3c2b7; --text-muted:#898781;
+    --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10);
+    --accent:#3987e5;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#0ca30c; --s7:#9085e9; --other:#6b6a65;
+    --q1:#9ec5f4; --q2:#6da7ec; --q3:#3987e5; --q4:#256abf; --q5:#184f95;
+    --shadow:0 6px 24px rgba(0,0,0,.5);
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --page:#0d0d0d; --surface-1:#1a1a19; --surface-2:#232321; --surface-3:#2c2c2a;
+  --text-primary:#f0efec; --text-secondary:#c3c2b7; --text-muted:#898781;
+  --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10);
+  --accent:#3987e5;
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s5:#d55181; --s6:#0ca30c; --s7:#9085e9; --other:#6b6a65;
+  --q1:#9ec5f4; --q2:#6da7ec; --q3:#3987e5; --q4:#256abf; --q5:#184f95;
+  --shadow:0 6px 24px rgba(0,0,0,.5);
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--page);color:var(--text-primary);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+button,select,input{font:inherit;color:inherit}
+.wrap{max-width:1400px;margin:0 auto;padding:16px}
+header.top{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px}
+.brand h1{font-size:20px;margin:0;font-weight:650;letter-spacing:-.01em}
+.brand .meta{color:var(--text-secondary);font-size:13px;word-break:break-all}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn{background:var(--surface-1);border:1px solid var(--border);border-radius:8px;padding:6px 12px;cursor:pointer}
+.btn:hover{background:var(--surface-2)}
+.btn.primary{background:var(--accent);color:#fff;border-color:transparent}
+.btn.primary:hover{filter:brightness(1.08)}
+.banner{background:var(--surface-2);border:1px dashed var(--axis);border-radius:10px;padding:10px 14px;margin-bottom:12px;color:var(--text-secondary);font-size:13px}
+.banner b{color:var(--text-primary)}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:12px}
+.kpi{background:var(--surface-1);border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+.kpi .label{color:var(--text-secondary);font-size:12px}
+.kpi .value{font-size:24px;font-weight:650;margin-top:2px}
+.kpi .sub{color:var(--text-muted);font-size:12px}
+.controls{display:flex;flex-wrap:wrap;gap:14px;align-items:center;background:var(--surface-1);border:1px solid var(--border);border-radius:12px;padding:8px 12px;margin-bottom:12px}
+.controls label{display:flex;gap:6px;align-items:center;color:var(--text-secondary);font-size:13px}
+.controls select{background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:3px 6px}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--grid);margin-bottom:12px;overflow-x:auto}
+.tab{background:none;border:0;border-bottom:2px solid transparent;padding:8px 12px;cursor:pointer;color:var(--text-secondary);white-space:nowrap}
+.tab[aria-selected="true"]{color:var(--text-primary);border-bottom-color:var(--accent);font-weight:600}
+.tab .count{color:var(--text-muted);font-weight:400;margin-left:4px}
+.panel{display:none}.panel.active{display:block}
+.card{background:var(--surface-1);border:1px solid var(--border);border-radius:12px;padding:12px}
+.crumbs{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-bottom:8px;font-size:13px}
+.crumbs button{background:none;border:0;padding:2px 4px;border-radius:4px;cursor:pointer;color:var(--accent)}
+.crumbs button:hover{background:var(--surface-2)}
+.crumbs .cur{color:var(--text-primary);font-weight:600;padding:2px 4px}
+.crumbs .sep{color:var(--text-muted)}
+.tm-head{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center}
+.legend{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--text-secondary);margin:4px 0 8px}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.legend i{width:10px;height:10px;border-radius:3px;display:inline-block}
+#tm{position:relative;height:min(62vh,600px);min-height:320px;background:var(--surface-1);border-radius:8px;overflow:hidden;user-select:none}
+.tm-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:12px}
+.side{display:flex;flex-direction:column;min-height:0;max-height:60vh;border:1px solid var(--grid);border-radius:8px;background:var(--surface-1);overflow:hidden}
+.side-hd{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-bottom:1px solid var(--grid)}
+.side-hd h3{margin:0;font-size:13px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.side-hd h3 span{font-weight:400;color:var(--text-muted)}
+.side-body{flex:1;min-height:0;overflow:auto}
+.side table.data{font-size:12.5px}
+.side table.data th,.side table.data td{padding:5px 8px}
+.side table.data th{cursor:default}
+.side tr[data-i]{cursor:pointer}
+.side tr.hl td{background:var(--surface-3)}
+.side td .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.btn.sm{padding:3px 9px;font-size:12px}
+.tile.hl{box-shadow:inset 0 0 0 2px var(--text-primary) !important;z-index:2}
+#tm{order:1}.gutter{order:2}.side{order:3}
+.gutter{display:none;position:relative;cursor:col-resize;touch-action:none;outline:none}
+.gutter::after{content:"";position:absolute;left:4px;top:0;bottom:0;width:2px;border-radius:1px;background:var(--grid);transition:background .15s}
+.gutter:hover::after,.gutter.drag::after,.gutter:focus-visible::after{background:var(--accent)}
+@media (min-width:1000px){
+  .tm-layout.split{grid-template-columns:var(--c1) 10px var(--c2);gap:0;height:min(62vh,600px)}
+  .tm-layout.split #tm{height:100%;min-height:0}
+  .tm-layout.split .side{max-height:none}
+  .tm-layout.split .gutter{display:block}
+  .tm-layout.split.flip #tm{order:3}
+  .tm-layout.split.flip .side{order:1}
+}
+.tm-layout.tree .side,.tm-layout.tree .gutter{display:none !important}
+.tm-layout.tree #tm{height:min(80vh,900px)}
+.tm-layout.list #tm,.tm-layout.list .gutter{display:none !important}
+.tm-layout.list .side{max-height:none}
+.tm-layout.list .side td .nm{max-width:none}
+.side .x{display:none}
+.tm-layout.list .side .x{display:table-cell}
+.layout-pick{position:relative}
+.snap{position:absolute;right:0;top:calc(100% + 6px);z-index:15;background:var(--surface-1);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow);padding:10px 12px;width:300px}
+.snap-title{font-size:11px;color:var(--text-muted);margin:6px 0 5px}
+.snap-title:first-child{margin-top:0}
+.snap-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.snap-opt{background:none;border:1px solid var(--border);border-radius:8px;padding:5px;cursor:pointer;display:flex;flex-direction:column;gap:4px;align-items:stretch}
+.snap-opt:hover,.snap-opt:focus-visible{border-color:var(--accent);background:var(--surface-2)}
+.snap-opt[aria-checked="true"]{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.snap-opt span{font-size:11px;color:var(--text-secondary);text-align:center;font-variant-numeric:tabular-nums}
+.mini{display:flex;gap:3px;height:34px}
+.mini.col{flex-direction:column}
+.mini .m-tm{background:var(--accent);border-radius:3px;opacity:.85}
+.mini .m-ct{border-radius:3px;background:repeating-linear-gradient(var(--surface-3) 0 3px,transparent 3px 6px);box-shadow:inset 0 0 0 1px var(--grid)}
+.snap-hint{font-size:11px;color:var(--text-muted);margin-top:8px}
+.tile{position:absolute;border-radius:4px;overflow:hidden;cursor:pointer;outline-offset:-2px}
+.tile.leaf:hover{filter:brightness(1.12)}
+.tile.group{background:var(--surface-2);box-shadow:inset 0 0 0 1px var(--border)}
+.tile.group:hover{box-shadow:inset 0 0 0 1px var(--axis)}
+.tile .hd{position:absolute;left:6px;right:6px;top:2px;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-primary)}
+.tile .hd em{font-style:normal;font-weight:400;color:var(--text-secondary);margin-left:6px}
+.tile .lb{position:absolute;left:5px;right:5px;top:3px;font-size:11px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+.tile .lb small{display:block;opacity:.85}
+.tile.ov{background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.16) 0 2px,transparent 2px 7px) !important;cursor:default}
+.legend .ovk{background:var(--other) repeating-linear-gradient(135deg,rgba(255,255,255,.35) 0 2px,transparent 2px 5px)}
+.tile.folder-leaf::after{content:"";position:absolute;inset:0;border-radius:4px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.35);pointer-events:none}
+#tip{position:fixed;z-index:20;pointer-events:none;background:var(--surface-1);color:var(--text-primary);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow);padding:10px 12px;font-size:12px;max-width:340px;display:none}
+#tip .t{font-weight:650;font-size:13px;word-break:break-word}
+#tip .p{color:var(--text-muted);word-break:break-all;margin-bottom:6px}
+#tip table{border-collapse:collapse;width:100%}
+#tip td{padding:1px 0}
+#tip td:last-child{text-align:right;font-variant-numeric:tabular-nums;padding-left:12px}
+#tip td:first-child{color:var(--text-secondary)}
+.pills{display:flex;flex-wrap:wrap;gap:4px}
+.pill{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:1px 7px;border-radius:999px;background:var(--surface-3);color:var(--text-primary);white-space:nowrap}
+.pill i{width:7px;height:7px;border-radius:50%;display:inline-block}
+.grid-tools{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:8px}
+.grid-tools input[type=search]{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:5px 10px;min-width:220px;max-width:100%}
+.note{color:var(--text-secondary);font-size:13px;margin:0 0 10px}
+.tbl-wrap{overflow-x:auto;border:1px solid var(--grid);border-radius:8px}
+table.data{border-collapse:collapse;width:100%;font-size:13px}
+table.data th{position:sticky;top:0;background:var(--surface-2);text-align:left;font-weight:600;color:var(--text-secondary);padding:7px 10px;border-bottom:1px solid var(--grid);cursor:pointer;white-space:nowrap}
+table.data th.num,table.data td.num{text-align:right;font-variant-numeric:tabular-nums}
+table.data th[aria-sort="descending"]::after{content:" \2193"}
+table.data th[aria-sort="ascending"]::after{content:" \2191"}
+table.data td{padding:6px 10px;border-bottom:1px solid var(--grid);vertical-align:top}
+table.data tr:hover td{background:var(--surface-2)}
+td .nm{font-weight:500;word-break:break-word}
+td .pt{color:var(--text-muted);font-size:12px;overflow-wrap:anywhere}
+.bar{height:6px;border-radius:3px;background:var(--accent);margin-top:4px;min-width:2px}
+.more{color:var(--text-muted);font-size:12px;padding:8px 10px}
+.split{display:grid;grid-template-columns:minmax(0,1fr);gap:12px}
+@media (min-width:900px){.split.two{grid-template-columns:minmax(260px,360px) minmax(0,1fr)}}
+h3{font-size:14px;margin:0 0 8px}
+.drop{position:fixed;inset:0;z-index:30;background:rgba(42,120,214,.12);border:3px dashed var(--accent);display:none;align-items:center;justify-content:center;font-size:18px;font-weight:600;color:var(--text-primary)}
+.drop.on{display:flex}
+.wi-head{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:12px}
+.wi-head h3{margin:0}
+.wi-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.wi-controls select,.wi-controls input{background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:4px 8px}
+.wi-controls input{width:90px}
+.wi-unit{color:var(--text-secondary);font-size:13px}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.seg button{background:none;border:0;padding:5px 11px;cursor:pointer;color:var(--text-secondary)}
+.seg button[aria-checked="true"]{background:var(--accent);color:#fff}
+.wi-top{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;margin-bottom:14px}
+@media (min-width:900px){.wi-top{grid-template-columns:minmax(240px,320px) minmax(0,1fr)}}
+.wi-hero{background:var(--surface-2);border-radius:10px;padding:14px 16px}
+.wi-hero .lab{color:var(--text-secondary);font-size:13px}
+.wi-hero .big{font-size:34px;font-weight:650;line-height:1.15;margin:4px 0 6px}
+.wi-hero .sub{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.wi-hero .basis{margin-top:10px;font-size:12px;color:var(--text-muted)}
+.wi-ct{font-size:12px;color:var(--text-secondary);margin-bottom:4px}
+#wiChart{position:relative;height:230px}
+#wiChart svg{display:block;width:100%;height:100%}
+#wiChart .tick{font-size:11px;fill:var(--text-muted);font-variant-numeric:tabular-nums}
+.wi-bottom{display:grid;grid-template-columns:minmax(0,1fr);gap:16px}
+@media (min-width:900px){.wi-bottom{grid-template-columns:minmax(0,2fr) minmax(0,3fr)}}
+.wi-note{margin:14px 0 0}
+footer{color:var(--text-muted);font-size:12px;margin-top:16px;text-align:center}
+@media (max-width:600px){.kpi .value{font-size:20px}#tm{height:55vh}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <h1>SharePoint Storage Tree</h1>
+      <div class="meta" id="siteMeta">-</div>
+    </div>
+    <div class="actions">
+      <button class="btn primary" id="btnLoad">Load report.json</button>
+      <select class="btn" id="optSample" aria-label="Load sample data">
+        <option value="">Sample data…</option>
+        <option value="site">Sample: single site</option>
+        <option value="subsites">Sample: site + subsites</option>
+        <option value="tenant">Sample: tenant</option>
+      </select>
+      <button class="btn" id="btnTheme" title="Toggle light/dark">Theme</button>
+      <input type="file" id="file" accept=".json,application/json" multiple hidden>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <section class="kpis" id="kpis"></section>
+
+  <section class="controls" aria-label="Analysis settings">
+    <label>Stale after
+      <select id="optStale">
+        <option value="6">6 months</option><option value="12">12 months</option>
+        <option value="24" selected>2 years</option><option value="36">3 years</option>
+      </select>
+    </label>
+    <label>Large file
+      <select id="optLarge">
+        <option value="10">&ge; 10 MB</option><option value="50" selected>&ge; 50 MB</option>
+        <option value="100">&ge; 100 MB</option><option value="500">&ge; 500 MB</option>
+      </select>
+    </label>
+    <span class="note" style="margin:0" id="ageRef"></span>
+  </section>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab" role="tab" data-tab="tree" aria-selected="true">Treemap</button>
+    <button class="tab" role="tab" data-tab="large">Largest files<span class="count" id="cLarge"></span></button>
+    <button class="tab" role="tab" data-tab="bloat">Version bloat<span class="count" id="cBloat"></span></button>
+    <button class="tab" role="tab" data-tab="stale">Stale &amp; ROT<span class="count" id="cStale"></span></button>
+    <button class="tab" role="tab" data-tab="copilot">Copilot readiness<span class="count" id="cCopilot"></span></button>
+  </nav>
+
+  <!-- Treemap -->
+  <section class="panel active" id="p-tree">
+    <div class="card">
+      <div class="tm-head">
+        <div class="crumbs" id="crumbs"></div>
+        <div class="controls" style="margin:0;padding:4px 8px;border:0;background:none">
+          <label>Size by
+            <select id="optSize">
+              <option value="total" selected>Storage used (incl. versions)</option>
+              <option value="current">Current version only</option>
+              <option value="version">Version history only</option>
+              <option value="reclaim">Reclaimable (what-if rule)</option>
+            </select>
+          </label>
+          <label>Color by
+            <select id="optColor">
+              <option value="type" selected>File type</option>
+              <option value="age">Last modified</option>
+              <option value="bloat">Version bloat</option>
+            </select>
+          </label>
+          <div class="layout-pick">
+            <button class="btn sm" id="btnLayout" aria-haspopup="menu" aria-expanded="false" title="Choose a layout">&#9707; Layout</button>
+            <div class="snap" id="snap" role="menu" hidden></div>
+          </div>
+        </div>
+      </div>
+      <div class="legend" id="legend"></div>
+      <div class="tm-layout">
+        <div id="tm" role="img" aria-label="Treemap of storage by folder and file"></div>
+        <div class="gutter" id="gutter" role="separator" aria-orientation="vertical" aria-label="Resize treemap and contents" tabindex="0" title="Drag to resize. Double-click to reset to 50/50."></div>
+        <aside class="side" aria-label="Contents of the current folder">
+          <div class="side-hd"><h3 id="levelTitle">Contents</h3><button class="btn sm" id="exLevel">Export CSV</button></div>
+          <div class="side-body" id="levelTable"></div>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-large"><div class="card">
+    <div class="grid-tools"><input type="search" placeholder="Filter by name or path" data-filter="large"><button class="btn" data-export="large">Export CSV</button></div>
+    <p class="note" id="nLarge"></p><div id="tLarge"></div></div></section>
+
+  <section class="panel" id="p-bloat">
+    <div class="card wi" id="whatif">
+      <div class="wi-head">
+        <h3>What-if: trim version history</h3>
+        <div class="wi-controls">
+          <div class="seg" role="radiogroup" aria-label="Trim rule">
+            <button role="radio" data-type="count" aria-checked="true">Keep latest</button>
+            <button role="radio" data-type="age" aria-checked="false">Delete older than</button>
+          </div>
+          <select id="wiPreset" aria-label="Rule value"></select>
+          <input type="number" id="wiCustom" min="1" step="1" hidden aria-label="Custom value">
+          <span id="wiUnit" class="wi-unit"></span>
+        </div>
+      </div>
+      <div class="wi-top">
+        <div class="wi-hero" id="wiHero"></div>
+        <div>
+          <div class="wi-ct" id="wiChartTitle"></div>
+          <div id="wiChart"></div>
+        </div>
+      </div>
+      <div class="wi-bottom">
+        <div><h3 id="wiByTitle">By library</h3><div id="wiLibs"></div></div>
+        <div><h3>Files that gain the most</h3><div id="wiFiles"></div></div>
+      </div>
+      <p class="note wi-note">This only models the change. Nothing is deleted. Before you act: if a <b>retention policy or hold</b> covers the site, trimmed versions move to the Preservation Hold Library and no space is freed. The count includes the current version, so "keep latest 25" means the current file plus 24 older versions. In libraries that keep minor (draft) versions, check whether your limit covers them too.</p>
+    </div>
+    <div class="card" style="margin-top:12px">
+    <div class="grid-tools"><input type="search" placeholder="Filter by name or path" data-filter="bloat"><button class="btn" data-export="bloat">Export CSV</button></div>
+    <p class="note" id="nBloat"></p><div id="tBloat"></div></div></section>
+
+  <section class="panel" id="p-stale">
+    <div class="split two">
+      <div class="card"><h3>Stale by file type</h3><div id="staleByType"></div></div>
+      <div class="card">
+        <div class="grid-tools"><input type="search" placeholder="Filter by name or path" data-filter="stale"><button class="btn" data-export="stale">Export CSV</button></div>
+        <p class="note" id="nStale"></p><div id="tStale"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="p-copilot">
+    <div class="split two">
+      <div class="card"><h3>Why files are flagged</h3><div id="copilotByReason"></div></div>
+      <div class="card">
+        <div class="grid-tools"><input type="search" placeholder="Filter by name or path" data-filter="copilot"><button class="btn" data-export="copilot">Export CSV</button></div>
+        <p class="note" id="nCopilot"></p><div id="tCopilot"></div>
+      </div>
+    </div>
+  </section>
+
+  <footer>SharePoint Storage Tree &middot; open source (MIT) &middot; runs entirely in your browser, nothing is uploaded.</footer>
+</div>
+<div id="tip" role="tooltip"></div>
+<div class="drop" id="drop">Drop one or more report.json files to load them</div>
+<!--SPST:DATA-->
+
+<script>
+"use strict";
+/* ---------------- utilities ---------------- */
+const $ = s => document.querySelector(s);
+const DAY = 86400000, MONTH = 30.44 * DAY;
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function fmtBytes(b){
+  if (!b) return "0 B";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0, v = b;
+  while (v >= 1024 && i < u.length - 1){ v /= 1024; i++; }
+  return (v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)) + " " + u[i];
+}
+const fmtInt = n => n.toLocaleString();
+const fmtPct = (a, b) => b ? (a / b * 100).toFixed(a / b < 0.1 ? 1 : 0) + "%" : "0%";
+const fmtDate = d => d ? d.toISOString().slice(0, 10) : "";
+function fmtAge(days){
+  if (days < 1) return "today";
+  if (days < 60) return Math.round(days) + " days";
+  if (days < 730) return Math.round(days / 30.44) + " months";
+  return (days / 365.25).toFixed(1) + " years";
+}
+const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+/* ---------------- classification ---------------- */
+const CATS = [ // fixed order = fixed colour slot (never cycled)
+  { key:"doc",   label:"Documents",     v:"--s1", ext:["doc","docx","docm","dot","dotx","rtf","odt","txt","md","one","msg","eml"] },
+  { key:"ppt",   label:"Presentations", v:"--s2", ext:["ppt","pptx","pptm","pps","ppsx","odp"] },
+  { key:"pdf",   label:"PDF",           v:"--s3", ext:["pdf"] },
+  { key:"xls",   label:"Spreadsheets",  v:"--s4", ext:["xls","xlsx","xlsm","xlsb","csv","ods"] },
+  { key:"img",   label:"Images & design", v:"--s5", ext:["png","jpg","jpeg","gif","bmp","tif","tiff","svg","webp","heic","psd","ai","vsdx"] },
+  { key:"media", label:"Video & audio", v:"--s6", ext:["mp4","mov","avi","wmv","mkv","webm","mp3","wav","m4a"] },
+  { key:"arc",   label:"Archives",      v:"--s7", ext:["zip","7z","rar","tar","gz","cab","iso","bak"] },
+  { key:"other", label:"Other",         v:"--other", ext:[] }
+];
+const CAT_BY_EXT = {}; CATS.forEach(c => c.ext.forEach(e => CAT_BY_EXT[e] = c));
+const catOf = ext => CAT_BY_EXT[ext] || CATS[CATS.length - 1];
+const extOf = name => { const m = /\.([^.]+)$/.exec(name); return m ? m[1].toLowerCase() : ""; };
+
+// Content Copilot can ground answers in (text-bearing formats).
+const INDEXABLE = new Set(["doc","docx","docm","dotx","rtf","txt","md","one","msg","eml","ppt","pptx","pptm","ppsx","pdf","xls","xlsx","xlsm","csv","html","htm","aspx","vtt","vsdx"]);
+const JUNK_EXT = new Set(["tmp","temp","bak","old","log","dmp","~tmp"]);
+// 113 Web Part Gallery, 114 List Template Gallery, 116 Master Page Gallery, 121 Solution Gallery, 122 Theme Gallery (old),
+// 123 Theme Gallery, 124 App Data, 126 App Files, 334 Client Side Assets, 336 Apps for SharePoint, 10102 Converted Forms
+const SYSTEM_TEMPLATES = new Set([113, 114, 116, 121, 122, 123, 124, 126, 334, 336, 10102]);
+
+const AGE_BUCKETS = [ // sequential, one hue light -> dark
+  { max: 90,       label:"< 3 months", v:"--q1" },
+  { max: 365,      label:"3-12 months", v:"--q2" },
+  { max: 730,      label:"1-2 years",  v:"--q3" },
+  { max: 1095,     label:"2-3 years",  v:"--q4" },
+  { max: Infinity, label:"> 3 years",  v:"--q5" }
+];
+const BLOAT_BUCKETS = [ // total / current
+  { max: 1.05,     label:"No history", v:"--q1" },
+  { max: 2,        label:"< 2×",  v:"--q2" },
+  { max: 5,        label:"2-5×",  v:"--q3" },
+  { max: 20,       label:"5-20×", v:"--q4" },
+  { max: Infinity, label:"> 20×", v:"--q5" }
+];
+const LIGHT_FILLS = new Set(["--s4","--q1","--q2"]); // need dark label ink
+
+/* ---------------- state ---------------- */
+let MODEL = null;
+const S = { staleMonths: 24, largeMB: 50, sizeBy: "total", colorBy: "type", tab: "tree", cur: null, filters: {}, sorts: {} };
+
+/* ---------------- model ---------------- */
+/* any report shape -> { scope, scannedAt, generator, tenant, sites[] }. v1.0 single-site reports still load. */
+const normUrl = u => String(u || "").replace(/\/+$/, "").toLowerCase();
+function normalize(report){
+  const raw = Array.isArray(report.sites) ? report.sites
+    : [{ ...(report.site || {}), libraries: report.libraries, files: report.files }];
+  const sites = raw.map(s => ({ ...s, deep: s.deep !== false && Array.isArray(s.files), scannedAt: s.scannedAt || report.scannedAt }));
+  return { scope: report.scope || (sites.length > 1 ? "tenant" : "site"), scannedAt: report.scannedAt, generator: report.generator,
+           tenant: report.tenant, sites };
+}
+/* several reports dropped together -> one view (same site twice: the newer scan wins) */
+function mergeReports(list){
+  const norm = list.map(normalize), byUrl = new Map();
+  for (const n of norm) for (const s of n.sites){
+    const k = normUrl(s.url) || s.title, old = byUrl.get(k);
+    if (!old || new Date(s.scannedAt || 0) >= new Date(old.scannedAt || 0)) byUrl.set(k, s);
+  }
+  const dates = norm.map(n => n.scannedAt).filter(Boolean).sort();
+  return { scope: norm.length === 1 ? norm[0].scope : "multi", scannedAt: dates[dates.length - 1], generator: norm[0].generator,
+           tenant: norm[0].tenant, sites: [...byUrl.values()] };
+}
+const isReport = r => r && (Array.isArray(r.files) || Array.isArray(r.sites));
+
+function buildModel(report){
+  const N = report;                       // already normalized
+  const scanDate = new Date(N.scannedAt || Date.now());
+  const files = [];
+  const webs = N.sites.map(s => ({ s, node: s.deep
+    ? { name: s.title || s.url || "Site", kind: "site", site: s, children: [], map: new Map(), parent: null }
+    : { name: s.title || s.url || "Site", kind: "ov", site: s, bytes: +s.storageUsed || 0, parent: null } }));
+  const multi = webs.length > 1;
+
+  for (const { s, node } of webs){
+    if (!s.deep) continue;
+    const siteScan = new Date(s.scannedAt || N.scannedAt || Date.now());
+    // system libraries (galleries, app catalog, client side assets, hidden lists) count toward storage
+    // but are never flagged as stale / ROT / Copilot risk: they aren't user content
+    const sysLib = new Set((s.libraries || []).filter(l => l.hidden || SYSTEM_TEMPLATES.has(+l.template)).map(l => l.title));
+    (s.files || []).forEach(rf => {
+      const size = +rf.size || 0, total = Math.max(size, +rf.totalSize || size), ext = extOf(rf.name || "");
+      const modified = rf.modified ? new Date(rf.modified) : null;
+      const f = {
+        id: files.length, site: node.name, siteUrl: s.url || "", web: node,
+        library: rf.library || "(unknown)", folder: (rf.folder || "").replace(/^\/+|\/+$/g, ""),
+        name: rf.name || "(unnamed)", ext, cat: catOf(ext), size, total,
+        versionCount: +rf.versionCount || 1, modified, modifiedBy: rf.modifiedBy || "",
+        created: rf.created ? new Date(rf.created) : null, url: rf.url || "",
+        ageDays: modified ? Math.max(0, (siteScan - modified) / DAY) : 0
+      };
+      f.system = sysLib.has(f.library);
+      f.path = [multi ? f.site : "", f.library, f.folder, f.name].filter(Boolean).join("/");
+      // per-version detail (old versions only), normalised newest-first
+      const raw = rf.versions;
+      f.hist = null; f.histDates = null;
+      if (Array.isArray(raw) && raw.length){
+        const vs = raw.map(v => ({ s: +v.size || 0, d: v.created ? +new Date(v.created) : NaN }));
+        const dated = vs.every(v => !isNaN(v.d));
+        if (dated) vs.sort((a, b) => b.d - a.d); else vs.reverse(); // undated: assume oldest-first
+        f.hist = vs.map(v => v.s);
+        if (dated) f.histDates = vs.map(v => v.d);
+      }
+      f.histCount = f.hist ? f.hist.length : Math.max(0, f.versionCount - 1);
+      if (f.hist){ f.suf = new Array(f.hist.length + 1).fill(0); for (let j = f.hist.length - 1; j >= 0; j--) f.suf[j] = f.suf[j + 1] + f.hist[j]; }
+      // split (total - size) into version history and overhead (metadata, renditions: not reclaimable)
+      const gap = f.total - f.size;
+      f.version = f.hist ? Math.min(gap, f.suf[0]) : f.histCount === 0 ? 0 : Math.min(gap, f.histCount * f.size);
+      f.overhead = gap - f.version;
+      f.histExact = !!f.hist;
+      if (f.hist && f.suf[0] > gap){ const r = gap / f.suf[0]; f.hist = f.hist.map(x => x * r); for (let j = 0; j < f.suf.length; j++) f.suf[j] *= r; }
+      files.push(f);
+    });
+  }
+
+  const child = (p, name, kind) => {
+    let n = p.map.get(name);
+    if (!n){ n = { name, kind, children: [], map: new Map(), parent: p }; p.map.set(name, n); p.children.push(n); }
+    return n;
+  };
+  for (const { s, node } of webs) if (s.deep) (s.libraries || []).forEach(l => child(node, l.title, "library"));
+  for (const f of files){
+    let n = child(f.web, f.library, "library");
+    if (f.folder) for (const part of f.folder.split("/")) n = child(n, part, "folder");
+    n.children.push({ name: f.name, kind: "file", file: f, parent: n });
+  }
+
+  // nest subsites under their parent web; everything else hangs off the root
+  const byUrl = new Map(webs.map(w => [normUrl(w.s.url), w.node]));
+  const tops = [];
+  for (const { s, node } of webs){
+    const p = s.parentUrl && byUrl.get(normUrl(s.parentUrl));
+    if (p && p.kind === "site" && p !== node){ node.parent = p; p.children.push(node); } else tops.push(node);
+  }
+  // storage the files don't account for (list rows, system data, uncounted libraries): per site collection
+  const fileBytes = n => n.kind === "file" ? n.file.total : n.kind === "site" || n.kind === "library" || n.kind === "folder" ? n.children.reduce((t, c) => t + fileBytes(c), 0) : 0;
+  for (const t of tops) if (t.kind === "site"){
+    const used = +t.site.storageUsed || 0, have = fileBytes(t);
+    if (used - have > Math.max(1024, used * 0.001))
+      t.children.push({ name: "Other (system, list overhead)", kind: "other", bytes: used - have, parent: t });
+  }
+  let root;
+  if (tops.length === 1) root = tops[0];
+  else {
+    const label = N.scope === "tenant" ? (N.tenant ? `${N.tenant} (tenant)` : "Tenant") : `${tops.length} sites`;
+    root = { name: label, kind: "scope", children: tops, parent: null };
+    tops.forEach(t => t.parent = root);
+  }
+
+  (function agg(n){
+    if (n.kind === "file"){
+      const f = n.file;
+      n.total = f.total; n.current = f.size; n.version = f.version; n.overhead = f.overhead; n.count = 1; n.ov = 0;
+      n.newest = f.modified; n.catSize = { [f.cat.key]: f.total };
+      return;
+    }
+    if (n.kind === "other" || n.kind === "ov"){
+      n.total = n.bytes; n.overhead = n.kind === "other" ? n.bytes : 0; n.ov = n.kind === "ov" ? n.bytes : 0;
+      n.current = n.version = n.count = 0; n.catSize = {};
+      n.newest = n.kind === "ov" && n.site.lastModified ? new Date(n.site.lastModified) : null;
+      return;
+    }
+    n.total = n.current = n.version = n.overhead = n.count = n.ov = 0; n.newest = null; n.catSize = {};
+    for (const c of n.children){
+      agg(c);
+      n.total += c.total; n.current += c.current; n.version += c.version; n.overhead += c.overhead; n.count += c.count; n.ov += c.ov;
+      if (c.newest && (!n.newest || c.newest > n.newest)) n.newest = c.newest;
+      for (const k in c.catSize) n.catSize[k] = (n.catSize[k] || 0) + c.catSize[k];
+    }
+  })(root);
+  root.path = "";
+  (function paths(n){ for (const c of n.children){ c.path = n.path ? n.path + "/" + c.name : c.name; if (c.children) paths(c); } })(root);
+
+  // duplicates: same name + same size in more than one place
+  const dup = new Map();
+  for (const f of files) if (!f.system){ const k = f.name.toLowerCase() + "|" + f.size; dup.set(k, (dup.get(k) || 0) + 1); }
+  files.forEach(f => f.dupCount = f.size > 0 && !f.system ? dup.get(f.name.toLowerCase() + "|" + f.size) : 1);
+
+  const all = webs.map(w => w.node), deep = all.filter(n => n.kind === "site");
+  let libCount = 0; deep.forEach(n => libCount += n.children.filter(c => c.kind === "library").length);
+  return { report: N, scanDate, files, root, multi, sites: all, deepSites: deep, ovSites: all.filter(n => n.kind === "ov"),
+           partial: N.sites.filter(s => s.partial), libCount };
+}
+
+/* flags depend on the stale / large settings */
+function computeFlags(){
+  const staleDays = S.staleMonths * 30.44, largeBytes = S.largeMB * 1024 * 1024;
+  for (const f of MODEL.files){
+    const rot = [];
+    if (JUNK_EXT.has(f.ext) || f.name.startsWith("~$")) rot.push("Temp / junk");
+    if (/^copy of /i.test(f.name) || / - copy( \(\d+\))?\.[^.]+$/i.test(f.name) || / \(\d+\)\.[^.]+$/.test(f.name)) rot.push("Copy");
+    if (f.dupCount > 1) rot.push("Duplicate ×" + f.dupCount);
+    if (f.size === 0) rot.push("Empty");
+    f.rot = f.system ? [] : rot;
+    f.stale = !f.system && f.ageDays > staleDays;
+    f.large = f.size >= largeBytes;
+    f.bloated = f.version > f.size && f.version > 0;
+    const reasons = [];
+    if (!f.system && INDEXABLE.has(f.ext)){
+      if (f.stale) reasons.push("Stale");
+      reasons.push(...rot.map(r => r.startsWith("Duplicate") ? "Duplicate" : r));
+      if (reasons.length && f.large) reasons.push("Large");
+    }
+    f.copilot = reasons;
+  }
+}
+
+/* ---------------- colour ---------------- */
+function bucket(list, x){ return list.find(b => x < b.max) || list[list.length - 1]; }
+const isLeaf = n => n.kind === "file" || n.kind === "other" || n.kind === "ov";
+function fillVar(n){
+  if (n.kind === "other" || (n.kind === "ov" && S.colorBy !== "age")) return "--other";
+  if (S.colorBy === "age"){
+    const d = n.newest ? (MODEL.scanDate - n.newest) / DAY : Infinity;
+    return bucket(AGE_BUCKETS, d).v;
+  }
+  if (S.colorBy === "bloat") return bucket(BLOAT_BUCKETS, n.current ? n.total / n.current : (n.total ? Infinity : 1)).v;
+  if (n.kind === "file") return n.file.cat.v;
+  let best = "other", bv = -1;
+  for (const k in n.catSize) if (n.catSize[k] > bv){ bv = n.catSize[k]; best = k; }
+  return CATS.find(c => c.key === best).v;
+}
+function renderLegend(){
+  const items = S.colorBy === "age" ? AGE_BUCKETS : S.colorBy === "bloat" ? BLOAT_BUCKETS : CATS;
+  const title = S.colorBy === "age" ? "Last modified" : S.colorBy === "bloat" ? "Storage ÷ current size" : "";
+  $("#legend").innerHTML = (title ? `<span style="color:var(--text-muted)">${title}:</span>` : "") +
+    items.map(b => `<span><i style="background:var(${b.v})"></i>${esc(b.label)}</span>`).join("") +
+    (MODEL.ovSites.length ? `<span><i class="ovk"></i>Summary only (not scanned in detail)</span>` : "") +
+    `<span style="color:var(--text-muted)">&middot; ${MODEL.multi ? "Sites and folders" : "Folders"} show as grey frames, or as tiles marked ▸ when they're too small. Click a folder to open it. Backspace goes back up.</span>`;
+}
+
+/* ---------------- treemap (squarified, no dependencies) ---------------- */
+const val = n => S.sizeBy === "current" ? n.current : S.sizeBy === "version" ? n.version : S.sizeBy === "reclaim" ? (n.reclaim || 0) : n.total;
+function squarify(items, x, y, w, h){
+  const out = [], total = items.reduce((s, i) => s + i.v, 0);
+  if (!total || w <= 0 || h <= 0) return out;
+  const k = (w * h) / total, list = items.map(i => ({ node: i.node, a: i.v * k }));
+  const worst = (row, s) => {
+    let sum = 0, max = 0, min = Infinity;
+    for (const r of row){ sum += r.a; if (r.a > max) max = r.a; if (r.a < min) min = r.a; }
+    const s2 = s * s, sum2 = sum * sum;
+    return Math.max(s2 * max / sum2, sum2 / (s2 * min));
+  };
+  const place = row => {
+    const sum = row.reduce((s, r) => s + r.a, 0);
+    if (w >= h){ const cw = sum / h; let cy = y; for (const r of row){ const rh = r.a / cw; out.push({ node: r.node, x, y: cy, w: cw, h: rh }); cy += rh; } x += cw; w -= cw; }
+    else       { const rh = sum / w; let cx = x; for (const r of row){ const rw = r.a / rh; out.push({ node: r.node, x: cx, y, w: rw, h: rh }); cx += rw; } y += rh; h -= rh; }
+  };
+  let row = [], i = 0;
+  while (i < list.length){
+    const s = Math.min(w, h), it = list[i];
+    if (!row.length || worst(row.concat(it), s) <= worst(row, s)){ row.push(it); i++; }
+    else { place(row); row = []; }
+  }
+  if (row.length) place(row);
+  return out;
+}
+const TILE = new WeakMap();   // element -> node
+let TILE_OF = new Map();       // top-level node -> element (for row <-> tile linking)
+function drawLevel(host, node, x, y, w, h, depth){
+  const kids = (node.children || []).filter(c => val(c) > 0).sort((a, b) => val(b) - val(a));
+  for (const r of squarify(kids.map(n => ({ node: n, v: val(n) })), x, y, w, h)){
+    const tw = r.w - 2, th = r.h - 2;
+    if (tw < 1.5 || th < 1.5) continue;
+    const n = r.node, el = document.createElement("div");
+    el.className = "tile";
+    el.style.cssText = `left:${r.x + 1}px;top:${r.y + 1}px;width:${tw}px;height:${th}px`;
+    TILE.set(el, n);
+    if (depth === 0) TILE_OF.set(n, el);
+    const isContainer = !isLeaf(n);
+    if (isContainer && (depth === 0 ? tw > 90 && th > 56 : depth === 1 && tw > 150 && th > 100)){
+      el.classList.add("group");
+      el.tabIndex = 0;
+      el.setAttribute("aria-label", `${n.name}, ${fmtBytes(val(n))}`);
+      el.innerHTML = `<div class="hd">${esc(n.name)}<em>${fmtBytes(val(n))}</em></div>`;
+      host.appendChild(el);
+      drawLevel(el, n, 1, 20, tw - 2, th - 21, depth + 1);
+    } else {
+      const v = fillVar(n);
+      el.classList.add("leaf");
+      if (isContainer){ el.classList.add("folder-leaf"); el.tabIndex = 0; }
+      if (n.kind === "ov") el.classList.add("ov");
+      el.style.background = `var(${v})`;
+      el.style.color = LIGHT_FILLS.has(v) ? "#0b0b0b" : "#ffffff";
+      if (tw > 64 && th > 18){
+        el.innerHTML = `<div class="lb">${isContainer ? "▸ " : ""}${esc(n.name)}${th > 32 ? `<small>${fmtBytes(val(n))}</small>` : ""}</div>`;
+      }
+      host.appendChild(el);
+    }
+  }
+}
+function drawTiles(){
+  const box = $("#tm"); box.innerHTML = "";
+  TILE_OF = new Map();
+  if (!val(S.cur)){
+    box.innerHTML = `<div style="padding:24px;color:var(--text-muted)">Nothing to show for this measure here. For example, there is no version history in this folder.</div>`;
+  } else drawLevel(box, S.cur, 0, 0, box.clientWidth, box.clientHeight, 0);
+  if (HL) TILE_OF.get(HL)?.classList.add("hl");
+}
+function renderTreemap(){
+  drawTiles();
+  const cur = S.cur;
+  // breadcrumb
+  const chain = []; for (let n = cur; n; n = n.parent) chain.unshift(n);
+  $("#crumbs").innerHTML = chain.map((n, i) => i === chain.length - 1
+      ? `<span class="cur">${esc(n.name)}</span><span class="sep">${fmtBytes(val(n))}</span>`
+      : `<button data-depth="${i}">${esc(n.name)}</button><span class="sep">/</span>`).join("");
+  $("#crumbs").querySelectorAll("button").forEach(b => b.onclick = () => { S.cur = chain[+b.dataset.depth]; renderTreemap(); });
+  renderLegend();
+  renderLevelTable();
+}
+function drill(n){ if (n && !isLeaf(n)){ S.cur = n; hideTip(); renderTreemap(); } }
+(function wireTreemap(){
+  const box = $("#tm");
+  box.addEventListener("click", e => {
+    const t = e.target.closest(".tile"); if (!t) return;
+    const n = TILE.get(t);
+    drill(isLeaf(n) ? (n.parent !== S.cur ? n.parent : null) : n);
+  });
+  box.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " "){ const t = e.target.closest(".tile"); if (t){ e.preventDefault(); drill(TILE.get(t)); } }
+    if (e.key === "Backspace" && S.cur.parent){ e.preventDefault(); drill(S.cur.parent); }
+  });
+  box.addEventListener("mousemove", e => {
+    const t = e.target.closest(".tile");
+    if (!t){ hideTip(); setHL(null, true); return; }
+    const n = TILE.get(t);
+    showTip(n, e.clientX, e.clientY);
+    let top = n; while (top && top.parent !== S.cur) top = top.parent;
+    setHL(top, true);
+  });
+  box.addEventListener("mouseleave", () => { hideTip(); setHL(null, true); });
+  let rq; new ResizeObserver(() => { cancelAnimationFrame(rq); rq = requestAnimationFrame(() => MODEL && S.tab === "tree" && drawTiles()); }).observe(box);
+})();
+
+/* ---------------- tooltip ---------------- */
+function showTip(n, x, y){
+  const tip = $("#tip"), rows = [];
+  if (n.kind === "other"){
+    const tip = $("#tip");
+    tip.innerHTML = `<div class="t">${esc(n.name)}</div><table><tr><td>Storage used</td><td>${fmtBytes(n.total)}</td></tr><tr><td>Share of site</td><td>${fmtPct(n.total, MODEL.root.total)}</td></tr></table><div class="p" style="margin:6px 0 0;max-width:260px">Site storage not tied to any file: list items, system data and empty libraries. Trimming versions doesn't change it.</div>`;
+    return placeTip(tip, x, y);
+  }
+  if (n.kind === "ov"){
+    const s = n.site, tip = $("#tip");
+    const r = [["Storage used", fmtBytes(n.total)], ["Share of total", fmtPct(n.total, MODEL.root.total)]];
+    if (s.template) r.push(["Template", esc(s.template)]);
+    if (n.newest) r.push(["Last content change", `${fmtDate(n.newest)} (${fmtAge((MODEL.scanDate - n.newest) / DAY)} ago)`]);
+    tip.innerHTML = `<div class="t">${esc(n.name)}</div><div class="p">${esc(s.url || "")}</div><table>${r.map(x => `<tr><td>${x[0]}</td><td>${x[1]}</td></tr>`).join("")}</table><div class="p" style="margin:6px 0 0">Summary only: this site wasn't scanned in detail, so there's no breakdown by library, file or version. To get one, scan it with <code>-Site</code> or add it to <code>-DeepScan</code>.</div>`;
+    return placeTip(tip, x, y);
+  }
+  rows.push(["Storage used", fmtBytes(n.total)], ["Current version", fmtBytes(n.current)], ["Version history", fmtBytes(n.version) + (n.current ? ` (${(n.total / n.current).toFixed(1)}×)` : "")]);
+  if (n.overhead >= 1024) rows.push(["Other overhead", `${fmtBytes(n.overhead)} <span style="color:var(--text-muted)">(not reclaimable)</span>`]);
+  rows.push([`Reclaimable (${esc(ruleLabel())})`, fmtBytes(n.reclaim || 0)]);
+  if (n.kind === "file"){
+    const f = n.file;
+    rows.push(["Versions", fmtInt(f.versionCount)], ["Modified", f.modified ? `${fmtDate(f.modified)} (${fmtAge(f.ageDays)} ago)` : "-"]);
+    if (f.modifiedBy) rows.push(["Modified by", esc(f.modifiedBy)]);
+  } else {
+    rows.push(["Files", fmtInt(n.count)], ["Share of site", fmtPct(n.total, MODEL.root.total)]);
+    if (n.newest) rows.push(["Newest change", fmtDate(n.newest)]);
+  }
+  const flags = n.kind === "file" ? pillsFor(n.file) : "";
+  tip.innerHTML = `<div class="t">${esc(n.name)}</div><div class="p">${esc(n.path)}</div><table>${rows.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("")}</table>${flags ? `<div class="pills" style="margin-top:6px">${flags}</div>` : ""}`;
+  placeTip(tip, x, y);
+}
+function placeTip(tip, x, y){
+  tip.style.display = "block";
+  const r = tip.getBoundingClientRect(), pad = 14;
+  let lx = x + pad, ly = y + pad;
+  if (lx + r.width > innerWidth - 8) lx = x - r.width - pad;
+  if (ly + r.height > innerHeight - 8) ly = y - r.height - pad;
+  tip.style.left = Math.max(8, lx) + "px"; tip.style.top = Math.max(8, ly) + "px";
+}
+function hideTip(){ $("#tip").style.display = "none"; }
+
+/* status pills - icon shape + label, never colour alone */
+const PILL = {
+  "Stale":       ["--q4", "◷"],
+  "Large":       ["--serious", "▲"],
+  "Duplicate":   ["--warning", "❐"],
+  "Copy":        ["--warning", "❐"],
+  "Temp / junk": ["--critical", "✖"],
+  "Empty":       ["--other", "○"],
+  "Version bloat": ["--serious", "▤"],
+  "Copilot":     ["--critical", "◆"]
+};
+function pill(label){
+  const key = label.startsWith("Duplicate") ? "Duplicate" : label;
+  const [v, ic] = PILL[key] || ["--other", "•"];
+  return `<span class="pill"><i style="background:var(${v})"></i>${ic} ${esc(label)}</span>`;
+}
+function pillsFor(f){
+  const p = [];
+  if (f.copilot.length) p.push(pill("Copilot"));
+  if (f.stale) p.push(pill("Stale"));
+  f.rot.forEach(r => p.push(pill(r)));
+  if (f.bloated) p.push(pill("Version bloat"));
+  if (f.large) p.push(pill("Large"));
+  return p.join("");
+}
+
+/* ---------------- tables ---------------- */
+const nameCell = f => `<div class="nm">${esc(f.name)}</div><div class="pt">${MODEL.multi ? esc(f.site) + " &rsaquo; " : ""}${esc(f.library + (f.folder ? "/" + f.folder : ""))}</div>`;
+const COL = {
+  name:     { label:"File", html: nameCell, csv: f => f.path, sort: f => f.name.toLowerCase() },
+  type:     { label:"Type", html: f => esc(f.cat.label) + (f.ext ? ` <span class="pt">.${esc(f.ext)}</span>` : ""), csv: f => f.ext, sort: f => f.cat.label },
+  size:     { label:"Current", num:true, html: f => fmtBytes(f.size), csv: f => f.size, sort: f => f.size },
+  version:  { label:"Version history", num:true, html: f => fmtBytes(f.version), csv: f => f.version, sort: f => f.version },
+  total:    { label:"Storage used", num:true, html: f => fmtBytes(f.total), csv: f => f.total, sort: f => f.total },
+  ratio:    { label:"× current", num:true, html: f => f.size ? (f.total / f.size).toFixed(1) + "×" : "-", csv: f => f.size ? (f.total / f.size).toFixed(2) : "", sort: f => f.size ? f.total / f.size : 0 },
+  reclaim:  { label:"Reclaimable", num:true, html: f => f.reclaim ? fmtBytes(f.reclaim) : "-", csv: f => Math.round(f.reclaim || 0), sort: f => f.reclaim || 0 },
+  vcount:   { label:"Versions", num:true, html: f => fmtInt(f.versionCount), csv: f => f.versionCount, sort: f => f.versionCount },
+  modified: { label:"Modified", html: f => f.modified ? `${fmtDate(f.modified)}<div class="pt">${fmtAge(f.ageDays)} ago</div>` : "-", csv: f => fmtDate(f.modified), sort: f => f.modified ? +f.modified : 0 },
+  by:       { label:"Modified by", html: f => esc(f.modifiedBy), csv: f => f.modifiedBy, sort: f => f.modifiedBy.toLowerCase() },
+  flags:    { label:"Flags", html: f => `<div class="pills">${pillsFor(f)}</div>`, csv: f => [f.stale && "Stale", ...f.rot, f.bloated && "Version bloat", f.large && "Large"].filter(Boolean).join("; "), sort: f => f.rot.length + f.stale },
+  reasons:  { label:"Why it's flagged", html: f => `<div class="pills">${f.copilot.map(pill).join("")}</div>`, csv: f => f.copilot.join("; "), sort: f => f.copilot.length }
+};
+const VIEWS = {
+  large:   { cols:["name","type","size","version","total","vcount","modified","by"], sort:["size","desc"],
+             rows: () => MODEL.files.filter(f => f.size > 0) },
+  bloat:   { cols:["name","size","version","ratio","vcount","reclaim","modified","by"], sort:["version","desc"],
+             rows: () => MODEL.files.filter(f => f.bloated) },
+  stale:   { cols:["name","type","total","modified","by","flags"], sort:["total","desc"],
+             rows: () => MODEL.files.filter(f => f.stale || f.rot.length) },
+  copilot: { cols:["name","reasons","total","modified","by"], sort:["total","desc"],
+             rows: () => MODEL.files.filter(f => f.copilot.length) }
+};
+const MAX_ROWS = 250;
+function viewRows(id){
+  const v = VIEWS[id], q = (S.filters[id] || "").toLowerCase();
+  let rows = v.rows();
+  if (q) rows = rows.filter(f => f.path.toLowerCase().includes(q) || f.modifiedBy.toLowerCase().includes(q));
+  const [k, dir] = S.sorts[id] || v.sort, fn = COL[k].sort, m = dir === "asc" ? 1 : -1;
+  return rows.slice().sort((a, b) => { const x = fn(a), y = fn(b); return x < y ? -m : x > y ? m : 0; });
+}
+function renderView(id){
+  const v = VIEWS[id], rows = viewRows(id), [sk, sd] = S.sorts[id] || v.sort;
+  const host = $("#t" + id[0].toUpperCase() + id.slice(1));
+  if (!rows.length){ host.innerHTML = `<div class="more">No files match.</div>`; return rows; }
+  host.innerHTML = `<div class="tbl-wrap"><table class="data"><thead><tr>${v.cols.map(c =>
+      `<th data-k="${c}" class="${COL[c].num ? "num" : ""}" ${c === sk ? `aria-sort="${sd === "asc" ? "ascending" : "descending"}"` : ""}>${COL[c].label}</th>`).join("")}</tr></thead>
+    <tbody>${rows.slice(0, MAX_ROWS).map(f => `<tr>${v.cols.map(c => `<td class="${COL[c].num ? "num" : ""}">${COL[c].html(f)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>
+    ${rows.length > MAX_ROWS ? `<div class="more">Showing the first ${MAX_ROWS} of ${fmtInt(rows.length)}. Use Export CSV to get them all.</div>` : ""}`;
+  host.querySelectorAll("th").forEach(th => th.onclick = () => {
+    const k = th.dataset.k, cur = S.sorts[id] || v.sort;
+    S.sorts[id] = [k, cur[0] === k && cur[1] === "desc" ? "asc" : "desc"];
+    renderView(id);
+  });
+  return rows;
+}
+function sumBy(rows, k){ return rows.reduce((s, f) => s + f[k], 0); }
+function renderNotes(){
+  const site = MODEL.root, all = MODEL.files;
+  const large = VIEWS.large.rows(), top10 = large.slice().sort((a, b) => b.size - a.size).slice(0, 10);
+  $("#nLarge").innerHTML = `The 10 largest files use <b>${fmtBytes(sumBy(top10, "size"))}</b>, which is ${fmtPct(sumBy(top10, "size"), site.current)} of current-version storage. ${fmtInt(all.filter(f => f.large).length)} files are ${S.largeMB} MB or larger.`;
+
+  const bl = VIEWS.bloat.rows();
+  $("#nBloat").innerHTML = `Version history uses <b>${fmtBytes(site.version)}</b>, which is ${fmtPct(site.version, site.total - site.ov)} of ${MODEL.ovSites.length ? "the storage scanned in detail" : MODEL.multi ? "these sites' storage" : "this site's storage"}. In ${fmtInt(bl.length)} files, the old versions take up more space than the current file. A version limit on the library (or trimming old versions) gets most of that space back.`;
+
+  const st = VIEWS.stale.rows(), stOnly = all.filter(f => f.stale);
+  $("#nStale").innerHTML = `${fmtInt(stOnly.length)} files (<b>${fmtBytes(sumBy(stOnly, "total"))}</b>) have not been modified in ${S.staleMonths} months. Another ${fmtInt(st.length - stOnly.length)} recent files look redundant, obsolete or trivial (ROT): copies, duplicates, temp files.`;
+
+  const cp = VIEWS.copilot.rows();
+  $("#nCopilot").innerHTML = `Microsoft 365 Copilot answers from content that users can open. These <b>${fmtInt(cp.length)}</b> stale or duplicate documents (${fmtBytes(sumBy(cp, "total"))}) can end up in answers as if they were current. Archive, delete or restrict them before you roll out Copilot.`;
+
+  // stale by type
+  const byType = CATS.map(c => {
+    const inCat = all.filter(f => f.cat === c), s = inCat.filter(f => f.stale);
+    return { c, n: s.length, b: sumBy(s, "total"), of: sumBy(inCat, "total") };
+  }).filter(r => r.n).sort((a, b) => b.b - a.b);
+  const maxB = Math.max(1, ...byType.map(r => r.b));
+  $("#staleByType").innerHTML = byType.length ? `<table class="data"><thead><tr><th>Type</th><th class="num">Files</th><th class="num">Stale storage</th></tr></thead><tbody>${byType.map(r =>
+    `<tr><td><span class="pill"><i style="background:var(${r.c.v})"></i>${esc(r.c.label)}</span></td><td class="num">${fmtInt(r.n)}</td><td class="num">${fmtBytes(r.b)}<div class="pt">${fmtPct(r.b, r.of)} of type</div><div class="bar" style="width:${(r.b / maxB * 100).toFixed(1)}%;margin-left:auto;background:var(${r.c.v})"></div></td></tr>`).join("")}</tbody></table>` : `<div class="more">Nothing is stale at this threshold.</div>`;
+
+  // copilot by reason
+  const reasons = {};
+  cp.forEach(f => f.copilot.forEach(r => { (reasons[r] ||= { n: 0, b: 0 }); reasons[r].n++; reasons[r].b += f.total; }));
+  const rr = Object.entries(reasons).sort((a, b) => b[1].b - a[1].b);
+  $("#copilotByReason").innerHTML = rr.length ? `<table class="data"><thead><tr><th>Reason</th><th class="num">Files</th><th class="num">Storage</th></tr></thead><tbody>${rr.map(([k, r]) =>
+    `<tr><td>${pill(k)}</td><td class="num">${fmtInt(r.n)}</td><td class="num">${fmtBytes(r.b)}</td></tr>`).join("")}</tbody></table>
+    <p class="note" style="margin-top:10px">A file gets flagged when it is a text-bearing format that Copilot reads (Office, PDF, text, email) <i>and</i> it is stale, a copy, a duplicate, or a temp file. "Large" is added when a flagged file is also over the size threshold. A file can have more than one reason.</p>` : `<div class="more">No files flagged.</div>`;
+}
+
+/* level table (accessible table view of the treemap's current level) */
+/* side panel: contents of the current level, linked to the treemap tiles */
+let ROW_OF = new Map(), HL = null;
+function renderLevelTable(){
+  const cur = S.cur, kids = (cur.children || []).slice().sort((a, b) => val(b) - val(a) || b.total - a.total);
+  $("#levelTitle").innerHTML = `${esc(cur.name)} <span>&middot; ${fmtInt(kids.length)} items</span>`;
+  const maxV = Math.max(1, ...kids.map(val)), shown = kids.slice(0, MAX_ROWS);
+  const host = $("#levelTable");
+  // first number column follows "Size by", so the sort order always matches what is shown
+  const lead = { total: ["Storage used", n => n.total], current: ["Current", n => n.current], version: ["Version history", n => n.version], reclaim: ["Reclaimable", n => n.reclaim || 0] }[S.sizeBy];
+  const showTotal = S.sizeBy !== "total";
+  host.innerHTML = `<table class="data"><thead><tr><th>Name</th><th class="num">${lead[0]}</th>${showTotal ? `<th class="num">Storage used</th>` : ""}<th class="num x">Current</th><th class="num">Versions</th><th class="num">Files</th><th class="x">Newest change</th></tr></thead><tbody>${
+    shown.map((n, i) => { const ov = n.kind === "ov", d = v => ov ? `<span title="Summary only">–</span>` : v;
+      return `<tr data-i="${i}" ${!isLeaf(n) ? 'tabindex="0"' : ""} title="${esc(n.name)}${ov ? " (summary only)" : ""}"><td><div class="nm">${n.kind === "site" || ov ? "\u{1F310} " : !isLeaf(n) ? "\u{1F4C1} " : ""}${esc(n.name)}${ov ? ` <span class="pt">summary only</span>` : ""}${n.kind === "site" && n.site.partial ? ` <span class="pt">⚠ partial scan</span>` : ""}</div><div class="bar" style="width:${(val(n) / maxV * 100).toFixed(1)}%;background:var(${fillVar(n)})"></div></td><td class="num">${S.sizeBy === "total" || !ov ? fmtBytes(lead[1](n)) : d()}</td>${showTotal ? `<td class="num">${fmtBytes(n.total)}</td>` : ""}<td class="num x">${d(fmtBytes(n.current))}</td><td class="num">${d(fmtBytes(n.version))}</td><td class="num">${d(fmtInt(n.count))}</td><td class="x">${fmtDate(n.newest)}</td></tr>`; }).join("")
+  }</tbody></table>${kids.length > MAX_ROWS ? `<div class="more">Showing ${MAX_ROWS} of ${fmtInt(kids.length)}.</div>` : ""}`;
+  host.scrollTop = 0;
+  ROW_OF = new Map(); HL = null;
+  host.querySelectorAll("tr[data-i]").forEach(tr => {
+    const n = shown[+tr.dataset.i];
+    ROW_OF.set(n, tr);
+    tr.onclick = () => drill(n);
+    tr.onkeydown = e => { if (e.key === "Enter"){ e.preventDefault(); drill(n); } };
+    tr.onmouseenter = () => setHL(n, false);
+    tr.onmouseleave = () => setHL(null, false);
+  });
+}
+function setHL(n, fromTile){
+  if (n === HL) return;
+  if (HL){ TILE_OF.get(HL)?.classList.remove("hl"); ROW_OF.get(HL)?.classList.remove("hl"); }
+  HL = n;
+  if (!n) return;
+  TILE_OF.get(n)?.classList.add("hl");
+  const tr = ROW_OF.get(n);
+  if (!tr) return;
+  tr.classList.add("hl");
+  if (fromTile){ // keep the row visible, scrolling only the side panel
+    const body = $("#levelTable"), head = body.querySelector("thead").offsetHeight;
+    if (tr.offsetTop < body.scrollTop + head || tr.offsetTop + tr.offsetHeight > body.scrollTop + body.clientHeight)
+      body.scrollTop = tr.offsetTop - body.clientHeight / 2;
+  }
+}
+
+/* ---------------- CSV ---------------- */
+function csvCell(v){ v = v == null ? "" : String(v); return /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v; }
+function download(name, text){
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["﻿" + text], { type: "text/csv;charset=utf-8" }));
+  a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function exportView(id){
+  const cols = ["name","site","library","folder","type","size","version","basis","overhead","total","vcount","reclaim","modified","by","flags","reasons"];
+  const extra = { site: { csv: f => f.siteUrl || f.site }, library: { label:"Library", csv: f => f.library }, folder: { label:"Folder", csv: f => f.folder },
+    basis: { csv: f => f.histExact ? "exact" : f.version ? "estimate" : "" }, overhead: { csv: f => Math.round(f.overhead) } };
+  const defs = cols.map(c => extra[c] || COL[c]);
+  const head = ["Path","Site","Library","Folder","Extension","Current bytes","Version history bytes","Version history basis","Other overhead bytes","Storage used bytes","Versions",`Reclaimable bytes (${ruleLabel()})`,"Modified","Modified by","Flags","Copilot reasons"];
+  const rows = viewRows(id).map(f => defs.map(d => csvCell(d.csv(f))).join(","));
+  download(`storagetree-${id}.csv`, [head.join(","), ...rows].join("\r\n"));
+}
+$("#exLevel").onclick = () => {
+  const kids = S.cur.children || [];
+  const lines = ["Name,Kind,Path,Storage used bytes,Current bytes,Version history bytes,Other overhead bytes,Files,Newest change",
+    ...kids.map(n => [n.name, n.kind, n.path, Math.round(n.total), n.current, Math.round(n.version), Math.round(n.overhead), n.count, fmtDate(n.newest)].map(csvCell).join(","))];
+  download("storagetree-level.csv", lines.join("\r\n"));
+};
+document.querySelectorAll("[data-export]").forEach(b => b.onclick = () => exportView(b.dataset.export));
+document.querySelectorAll("[data-filter]").forEach(inp => inp.oninput = () => { S.filters[inp.dataset.filter] = inp.value; renderView(inp.dataset.filter); });
+
+/* ---------------- KPIs + full render ---------------- */
+function renderKpis(){
+  const r = MODEL.root, all = MODEL.files;
+  const stale = all.filter(f => f.stale), cp = all.filter(f => f.copilot.length);
+  const M = MODEL, deepTotal = r.total - r.ov, ofDeep = M.ovSites.length ? "of storage scanned in detail" : "of storage";
+  const where = M.multi ? `${fmtInt(M.sites.length)} sites${M.ovSites.length ? ` (${fmtInt(M.deepSites.length)} scanned in detail, ${fmtInt(M.ovSites.length)} summary only)` : ""} &middot; ${fmtInt(r.count)} files`
+                        : `${fmtInt(r.count)} files in ${M.libCount} libraries`;
+  const k = [
+    ["Storage used", fmtBytes(r.total), `${where}${r.overhead >= 1024 * 1024 ? ` &middot; ${fmtBytes(r.overhead)} is overhead (metadata, previews, system data)` : ""}`],
+    ["Version history", fmtBytes(r.version), `${fmtPct(r.version, deepTotal)} ${ofDeep} &middot; ${MODEL.reclaim.est ? "≈ " : ""}${fmtBytes(MODEL.reclaim.total)} reclaimable if you ${esc(ruleLabel())}`],
+    ["Current versions", fmtBytes(r.current), `${fmtPct(r.current, deepTotal)} ${ofDeep}`],
+    [`Stale (> ${S.staleMonths} mo)`, fmtBytes(sumBy(stale, "total")), `${fmtInt(stale.length)} files`],
+    ["Copilot-flagged", fmtInt(cp.length), `${fmtBytes(sumBy(cp, "total"))} of stale or ROT content`]
+  ];
+  $("#kpis").innerHTML = k.map(([l, v, s]) => `<div class="kpi"><div class="label">${l}</div><div class="value">${v}</div><div class="sub">${s}</div></div>`).join("");
+  $("#cLarge").textContent = fmtInt(all.filter(f => f.large).length);
+  $("#cBloat").textContent = fmtInt(all.filter(f => f.bloated).length);
+  $("#cStale").textContent = fmtInt(VIEWS.stale.rows().length);
+  $("#cCopilot").textContent = fmtInt(cp.length);
+}
+function renderAll(){
+  computeFlags();
+  computeReclaim();
+  renderKpis(); renderNotes(); renderWhatIf();
+  ["large","bloat","stale","copilot"].forEach(renderView);
+  if (S.tab === "tree") renderTreemap();
+}
+const SAMPLE_TEXT = {
+  site: "a made-up site",
+  subsites: "a made-up site with three subsites",
+  tenant: "a made-up tenant: 3 sites scanned in detail, the rest summary only"
+};
+/* input = one report or an array of reports (dropped together). sample = "site" | "subsites" | "tenant" | false */
+function load(input, sample){
+  const list = Array.isArray(input) ? input : [input];
+  if (!list.length || !list.every(isReport)) { alert("This doesn't look like an SPStorageTree report (it has no 'files' or 'sites' array)."); return; }
+  const N = list.length === 1 ? normalize(list[0]) : mergeReports(list);
+  MODEL = buildModel(N);
+  S.cur = MODEL.root;
+  const M = MODEL, nSub = M.sites.length - 1;
+  const what = !M.multi ? esc(M.sites[0].site.url || M.root.name)
+    : N.scope === "subsites" ? `${esc(M.root.site?.url || M.root.name)} and ${fmtInt(nSub)} subsite${nSub === 1 ? "" : "s"}`
+    : N.scope === "tenant" ? `Tenant overview &middot; ${fmtInt(M.sites.length)} sites`
+    : `${fmtInt(M.sites.length)} sites from ${fmtInt(list.length)} reports`;
+  $("#siteMeta").innerHTML = `${what} &middot; scanned ${esc(fmtDate(M.scanDate))}${N.generator ? ` &middot; ${esc(N.generator.name)} ${esc(N.generator.version || "")}` : ""}`;
+  $("#ageRef").textContent = `File ages are measured from the scan date (${fmtDate(M.scanDate)}).`;
+  const parts = [];
+  if (sample) parts.push(`<b>Sample data.</b> This is ${SAMPLE_TEXT[sample]}. To see your own, run <code>Get-SPStorageTree -Site &lt;url&gt; -Out report.json</code> (add <code>-IncludeSubsites</code>, or use <code>-Tenant</code>), then drop report.json on this page or click <b>Load report.json</b>. You can drop several reports at once.`);
+  if (list.length > 1) parts.push(`<b>${fmtInt(list.length)} reports combined.</b> Where a site appears in more than one, the newest scan is used.`);
+  if (M.partial.length) parts.push(`<b>⚠ Partial scan:</b> ${M.partial.map(s => esc(s.title || s.url)).join(", ")} ${M.partial.length === 1 ? "was" : "were"} scanned by an account that isn't a site collection admin. Libraries that account can't open are missing, and the site's total storage couldn't be read. For a complete picture, scan as a site collection admin.${M.partial.some(s => s.partialReason) ? ` (${M.partial.map(s => s.partialReason).filter(Boolean).map(esc).join("; ")})` : ""}`);
+  const bn = $("#banner");
+  bn.hidden = !parts.length;
+  bn.innerHTML = parts.map(p => `<div>${p}</div>`).join(`<div style="height:6px"></div>`);
+  $("#optSample").value = sample || "";
+  renderAll();
+}
+
+/* ---------------- UI wiring ---------------- */
+document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x => x.setAttribute("aria-selected", x === t));
+  document.querySelectorAll(".panel").forEach(p => p.classList.toggle("active", p.id === "p-" + t.dataset.tab));
+  S.tab = t.dataset.tab; hideTip();
+  if (S.tab === "tree") renderTreemap();
+});
+$("#optStale").onchange = e => { S.staleMonths = +e.target.value; renderAll(); };
+$("#optLarge").onchange = e => { S.largeMB = +e.target.value; renderAll(); };
+$("#optSize").onchange = e => { S.sizeBy = e.target.value; renderTreemap(); };
+$("#optColor").onchange = e => { S.colorBy = e.target.value; renderTreemap(); };
+$("#btnTheme").onclick = () => {
+  const dark = document.documentElement.dataset.theme
+    ? document.documentElement.dataset.theme === "dark"
+    : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = dark ? "light" : "dark";
+  try { localStorage.setItem("spst-theme", document.documentElement.dataset.theme); } catch {}
+};
+try { const t = localStorage.getItem("spst-theme"); if (t) document.documentElement.dataset.theme = t; } catch {}
+$("#btnLoad").onclick = () => $("#file").click();
+$("#optSample").onchange = e => { if (e.target.value) load(makeSample(e.target.value), e.target.value); };
+async function readFiles(fileList){
+  const fs = [...fileList].filter(f => /\.json$/i.test(f.name) || f.type.includes("json"));
+  if (!fs.length) return;
+  try {
+    const reports = await Promise.all(fs.map(f => f.text().then(t => {
+      try { return JSON.parse(t.replace(/^﻿/, "")); } catch (e) { throw new Error(`${f.name}: ${e.message}`); }
+    })));
+    load(reports.length === 1 ? reports[0] : reports, false);
+  } catch (e) { alert("Couldn't read that file as JSON: " + e.message); }
+}
+$("#file").onchange = e => { readFiles(e.target.files); e.target.value = ""; };
+let dragDepth = 0;
+addEventListener("dragenter", e => { e.preventDefault(); dragDepth++; $("#drop").classList.add("on"); });
+addEventListener("dragleave", () => { if (--dragDepth <= 0){ dragDepth = 0; $("#drop").classList.remove("on"); } });
+addEventListener("dragover", e => e.preventDefault());
+addEventListener("drop", e => { e.preventDefault(); dragDepth = 0; $("#drop").classList.remove("on"); readFiles(e.dataTransfer.files); });
+
+/* ---------------- sample data (deterministic, fictional) ---------------- */
+function makeHubReport(){
+  let seed = 20261114;
+  const rnd = () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+  const pick = a => a[Math.floor(rnd() * a.length)];
+  const int = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+  const gauss = () => Math.sqrt(-2 * Math.log(rnd() || 1e-9)) * Math.cos(2 * Math.PI * rnd());
+  const logn = (m, s) => Math.max(1024, Math.round(m * Math.exp(gauss() * s)));
+  let ohs = 7; const ohr = () => (ohs = ohs * 16807 % 2147483647) / 2147483647;
+  const scan = new Date("2026-11-14T09:30:00Z");
+  const T = { // median bytes, spread, max versions
+    docx:[380e3,1,45], pptx:[7e6,.9,60], xlsx:[900e3,1.1,90], pdf:[1.4e6,1.2,3], png:[700e3,1,2], jpg:[2.8e6,.7,2],
+    mp4:[260e6,.8,3], zip:[45e6,1.2,2], csv:[2e6,1.3,10], psd:[90e6,.7,18], txt:[20e3,1,6], vsdx:[1.2e6,.8,25], aspx:[30e3,.5,40], mov:[600e6,.6,2]
+  };
+  const people = ["Alex Wilber","Megan Bowen","Adele Vance","Diego Siciliani","Lee Gu","Lynne Robbins","Nestor Wilke","Pradeep Gupta","Isaiah Langer","Johanna Lorenz"];
+  const words = ["Quarterly","Budget","Roadmap","Vendor","Onboarding","Policy","Proposal","Status","Design","Review","Forecast","Contract","Training","Release","Survey","Inventory","Migration","Governance","Pilot","Retrospective","Workshop","Pricing","Audit","Launch","Customer","Partner"];
+  const nouns = ["Plan","Report","Notes","Deck","Summary","Template","Brief","Checklist","Tracker","Analysis","Guide","Minutes","Draft","Overview"];
+  const LIBS = [
+    { title:"Documents", url:"Shared Documents", age:[2,1400], mix:["docx","docx","docx","xlsx","xlsx","pptx","pdf","pdf","vsdx","csv","txt"],
+      folders:["","Projects/Alpha","Projects/Beta","Projects/Gamma/Specs","Projects/Gamma/Meeting Notes","HR/Policies","HR/Onboarding","Finance/Budgets/FY24","Finance/Budgets/FY25","Finance/Invoices"] },
+    { title:"Book Drafts", url:"Book Drafts", age:[1,500], mix:["docx","docx","docx","png","png","pdf","pptx"],
+      folders:["","Chapters","Chapters/Old","Figures","Figures/Raw","Reviews"] },
+    { title:"Marketing Media", url:"Marketing Media", age:[20,1600], mix:["jpg","jpg","jpg","png","mp4","psd","pptx","pdf","mov"],
+      folders:["","Video","Photos/Events 2023","Photos/Events 2025","Brand","Campaigns/Spring"] },
+    { title:"Project Records", url:"Project Records", age:[800,2400], mix:["pdf","pdf","docx","xlsx","zip","docx","msg"],
+      folders:["","2019","2020","2021","2022"] },
+    { title:"Site Pages", url:"SitePages", age:[5,900], mix:["aspx"], folders:[""] }
+  ];
+  T.msg = [180e3, 1, 1];
+  const files = [];
+  const add = (lib, folder, name, size, versions, ageDays) => {
+    const modified = new Date(scan - ageDays * DAY);
+    const created = new Date(modified - int(versions > 1 ? 20 : 0, versions > 50 ? 900 : 400) * DAY);
+    const k = versions - 1, span = modified - created, hist = [];
+    const grows = /\.(docx|pptx|xlsx|vsdx|txt|csv|aspx)$/i.test(name); // documents grow; media doesn't
+    for (let j = 0; j < k; j++){ // oldest first
+      const frac = k > 1 ? j / (k - 1) : 1;
+      const s = Math.round(size * (grows ? 0.3 + 0.7 * Math.pow(frac, 0.8) : 0.85 + rnd() * 0.2) * (0.92 + rnd() * 0.12));
+      hist.push({ label: `${j + 1}.0`, size: s, created: new Date(+created + span * ((j + rnd() * 0.9) / Math.max(1, k))).toISOString() });
+    }
+    const histBytes = hist.reduce((t, h) => t + h.size, 0);
+    // overhead as measured in the lab: ~300-600 B metadata per file, 2-85 KB more on versioned files,
+    // and previews/renditions on images and video (up to a few MB). Separate RNG so the sample stays stable.
+    const media = /\.(jpg|png|mp4|mov|psd)$/i.test(name);
+    const overhead = Math.round(300 + ohr() * 300 + (k ? 2e3 + ohr() * 83e3 : 0) + (media ? Math.min(6e6, size * (0.002 + ohr() * 0.018)) : 0));
+    const rec = { library: lib.title, folder, name, size, totalSize: size + histBytes + overhead, versionCount: versions,
+      modified: modified.toISOString(), modifiedBy: pick(people), created: created.toISOString(),
+      url: `/sites/ProjectHub/${lib.url}/${folder ? folder + "/" : ""}${name}` };
+    if (k >= 10 || histBytes > 50 * 1024 * 1024) rec.versions = hist; // same rule the scanner will use
+    files.push(rec);
+  };
+  const used = new Set();
+  for (const lib of LIBS){
+    for (const folder of lib.folders){
+      const n = lib.title === "Site Pages" ? 24 : int(8, 42);
+      const top = folder.split("/")[0];
+      const mix = top === "Video" ? ["mp4","mp4","mov"] : top === "Photos" ? ["jpg","jpg","jpg","png"]
+                : top === "Brand" ? ["psd","png","png","pdf"] : top === "Figures" ? ["png","png","vsdx"] : lib.mix;
+      for (let i = 0; i < n; i++){
+        const ext = pick(mix), [m, s, mv] = T[ext];
+        let name; do { name = `${pick(words)} ${pick(nouns)}${rnd() < .3 ? " " + int(1, 12) : ""}.${ext}`; } while (used.has(lib.title + folder + name));
+        used.add(lib.title + folder + name);
+        const versions = Math.max(1, Math.round(Math.pow(rnd(), 2.2) * mv));
+        const yearHint = /20(19|2[0-5])/.exec(folder);
+        const age = yearHint ? (scan.getUTCFullYear() - +("20" + yearHint[1])) * 365 + int(-150, 150) : int(lib.age[0], lib.age[1]) * Math.pow(rnd(), .5);
+        add(lib, folder, name, logn(m, s), versions, Math.max(0, age));
+      }
+    }
+  }
+  const L = t => LIBS.find(l => l.title === t);
+  // headline problems
+  add(L("Documents"), "Projects/Alpha", "Quarterly Business Review.pptx", 86e6, 142, 12);
+  add(L("Documents"), "Finance/Budgets/FY25", "Budget Master.xlsx", 14e6, 410, 3);
+  add(L("Documents"), "Finance/Budgets/FY25", "~$Budget Master.xlsx", 165, 1, 3);
+  add(L("Book Drafts"), "Chapters", "Full Manuscript.docx", 38e6, 220, 1);
+  add(L("Book Drafts"), "Chapters/Old", "Full Manuscript - Copy.docx", 31e6, 60, 410);
+  add(L("Marketing Media"), "Video", "Product Launch Final.mp4", 1.85e9, 2, 1180);
+  add(L("Marketing Media"), "Video", "Product Launch Final (1).mp4", 1.85e9, 1, 1179);
+  add(L("Marketing Media"), "Brand", "Brand Master Artwork.psd", 410e6, 34, 760);
+  add(L("Project Records"), "", "site-backup-2019.bak", 2.4e9, 1, 2500);
+  add(L("Project Records"), "2021", "export.log", 95e6, 1, 1700);
+  add(L("Documents"), "HR/Policies", "Employee Handbook.docx", 2.1e6, 38, 980);
+  add(L("Documents"), "HR/Onboarding", "Copy of Employee Handbook.docx", 2.1e6, 1, 1500);
+  add(L("Documents"), "", "Employee Handbook (1).docx", 1.9e6, 1, 1320);
+  add(L("Documents"), "Projects/Beta", "Empty Template.docx", 0, 1, 700);
+  // a few duplicates scattered across folders
+  const docs = files.filter(f => f.library === "Documents" && /\.(docx|pdf|xlsx)$/.test(f.name));
+  for (let i = 0; i < 9; i++){
+    const src = pick(docs), lib = L("Documents"), folder = pick(lib.folders.filter(x => x !== src.folder));
+    add(lib, folder, src.name, src.size, 1, int(400, 1500));
+  }
+  return {
+    schemaVersion: "1.0",
+    generator: { name: "SPStorageTree", version: "0.1.0 (sample)" },
+    scannedAt: scan.toISOString(),
+    site: { url: "https://contoso.sharepoint.com/sites/ProjectHub", title: "Project Hub",
+            storageUsed: Math.round(files.reduce((s, f) => s + f.totalSize, 0) * 1.004 + 48e6) }, // + list rows, system data
+    libraries: LIBS.map(l => ({ title: l.title, url: "/sites/ProjectHub/" + l.url, itemCount: files.filter(f => f.library === l.title).length })),
+    files
+  };
+}
+
+/* sample in each scan mode. "site" = v1.0 single-site shape (keeps old reports working); others = v1.1 sites[] */
+function makeSample(kind = "site"){
+  const hub = makeHubReport();
+  if (kind === "site") return hub;
+  const base = "https://contoso.sharepoint.com/sites/ProjectHub";
+  const pickLibs = titles => ({ libraries: hub.libraries.filter(l => titles.includes(l.title)), files: hub.files.filter(f => titles.includes(f.library)) });
+  const used = files => Math.round(files.reduce((s, f) => s + f.totalSize, 0) * 1.004 + 14e6);
+  const head = scope => ({ schemaVersion: "1.1", generator: hub.generator, scannedAt: hub.scannedAt, scope });
+  if (kind === "subsites"){
+    const webs = [["marketing", "Marketing", ["Marketing Media"]], ["publishing", "Publishing", ["Book Drafts"]], ["records", "Records Archive", ["Project Records"]]];
+    const top = { url: base, title: "Project Hub", storageUsed: hub.site.storageUsed, ...pickLibs(["Documents", "Site Pages"]) };
+    const subs = webs.map(([p, title, libs]) => {
+      const x = pickLibs(libs);
+      return { url: `${base}/${p}`, title, parentUrl: base, libraries: x.libraries,
+               files: x.files.map(f => ({ ...f, url: f.url.replace("/sites/ProjectHub/", `/sites/ProjectHub/${p}/`) })) };
+    });
+    return { ...head("subsites"), sites: [top, ...subs] };
+  }
+  // tenant: overview of every site + three scanned in detail (one by a non-admin account = partial)
+  const t = "https://contoso.sharepoint.com/sites/";
+  const reurl = (files, s) => files.map(f => ({ ...f, url: f.url.replace("/sites/ProjectHub/", `/sites/${s}/`) }));
+  const a = pickLibs(["Documents", "Site Pages", "Book Drafts"]), b = pickLibs(["Marketing Media"]), c = pickLibs(["Project Records"]);
+  const deep = [
+    { url: t + "ProjectHub", title: "Project Hub", template: "SITEPAGEPUBLISHING#0", storageUsed: used(a.files), ...a },
+    { url: t + "Marketing", title: "Marketing", template: "GROUP#0", storageUsed: used(b.files), libraries: b.libraries, files: reurl(b.files, "Marketing") },
+    { url: t + "LegalArchive", title: "Legal Archive", template: "STS#3", partial: true, partialReason: "scanned as a site member",
+      libraries: c.libraries, files: reurl(c.files, "LegalArchive") }
+  ];
+  let sd = 77; const r = () => (sd = sd * 16807 % 2147483647) / 2147483647;
+  const GB = 1024 ** 3, scan = new Date(hub.scannedAt);
+  const OV = [ // title, template, GB, days since last change
+    ["Design Studio", "GROUP#0", 84, 20], ["Archive 2018", "STS#3", 121, 2300], ["Intranet Home", "SITEPAGEPUBLISHING#0", 6.5, 1],
+    ["HR Hub", "SITEPAGEPUBLISHING#0", 11, 9], ["IT Service Desk", "GROUP#0", 23, 2], ["Finance", "GROUP#0", 38, 4],
+    ["Sales Team", "GROUP#0", 17, 6], ["Executive Board", "GROUP#0", 4.2, 30], ["Product Engineering", "GROUP#0", 46, 1],
+    ["Customer Success", "GROUP#0", 9.5, 12], ["Communications", "SITEPAGEPUBLISHING#0", 13, 3], ["Procurement", "STS#3", 3.1, 410],
+    ["Facilities", "STS#3", 1.4, 860], ["Learning & Development", "SITEPAGEPUBLISHING#0", 27, 45], ["Partner Portal", "STS#3", 7.8, 120],
+    ["Project Apollo", "GROUP#0", 19, 640], ["Project Zephyr", "GROUP#0", 2.2, 15], ["Legal Team", "GROUP#0", 5.6, 22],
+    ["Old Team Site", "STS#0", 0.6, 3100], ["Search Center", "SRCHCEN#0", 0.05, 900]
+  ];
+  const ov = OV.map(([title, template, gb, days]) => ({
+    url: t + title.replace(/[^A-Za-z0-9]/g, ""), title, template, deep: false,
+    storageUsed: Math.round(gb * GB * (0.9 + r() * 0.2)),
+    lastModified: new Date(+scan - days * DAY).toISOString()
+  }));
+  return { ...head("tenant"), tenant: "contoso", sites: [...deep, ...ov] };
+}
+
+/* ---------------- what-if: trim version history ---------------- */
+// count: keep the latest N versions INCLUDING the current one. age: delete old versions created before (scan date - days).
+S.trim = { type: "count", n: 25, days: 365 };
+const COUNT_PRESETS = [5, 10, 25, 50, 100, 500], AGE_PRESETS = [30, 90, 180, 365, 730, 1095];
+const CURVE_X = { count: [1,2,3,5,10,15,20,25,30,40,50,75,100,150,200,300,500], age: [7,14,30,60,90,180,270,365,545,730,1095,1825] };
+const fmtDays = d => d % 365 === 0 ? `${d / 365} year${d === 365 ? "" : "s"}` : `${d} days`;
+const shortDays = d => d % 365 === 0 ? `${d / 365}y` : d >= 30 && d % 30 === 0 ? `${d / 30}mo` : `${d}d`;
+const ruleLabel = (t = S.trim) => t.type === "count" ? `keep the latest ${t.n}` : `delete versions older than ${fmtDays(t.days)}`;
+
+/* returns [bytes reclaimed, old versions removed] for one file; exact when per-version data exists */
+function reclaimFor(f, t){
+  const k = f.histCount;
+  if (k <= 0 || f.version <= 0) return [0, 0];
+  let del;
+  if (t.type === "count"){
+    del = Math.max(0, k - Math.max(0, t.n - 1));
+  } else {
+    const cutoff = +MODEL.scanDate - t.days * DAY;
+    if (f.hist && f.histDates){
+      const i = f.histDates.findIndex(d => d < cutoff);
+      return i < 0 ? [0, 0] : [f.suf[i], k - i];
+    }
+    // no dates: assume old versions were spread evenly between created and modified
+    const start = +(f.created || f.modified || MODEL.scanDate), end = +(f.modified || MODEL.scanDate);
+    del = end <= start ? (start < cutoff ? k : 0) : Math.min(k, Math.max(0, Math.ceil((cutoff - start) / (end - start) * k)));
+  }
+  if (!del) return [0, 0];
+  if (f.hist) return [f.suf[k - del], del];   // oldest `del` versions, exact sizes
+  return [f.version * del / k, del];            // estimate: equal-size versions
+}
+function computeReclaim(){
+  let total = 0, exact = 0, files = 0, removed = 0;
+  for (const f of MODEL.files){
+    const [b, r] = reclaimFor(f, S.trim);
+    f.reclaim = b; f.removed = r;
+    if (b > 0){ total += b; files++; removed += r; if (f.hist) exact += b; }
+  }
+  (function agg(n){
+    if (n.kind === "file"){ n.reclaim = n.file.reclaim; return; }
+    if (n.kind === "other" || n.kind === "ov"){ n.reclaim = 0; return; }
+    n.reclaim = 0; for (const c of n.children){ agg(c); n.reclaim += c.reclaim; }
+  })(MODEL.root);
+  MODEL.reclaim = { total, exact, est: total - exact > 0.5, files, removed };
+}
+function curvePoints(){
+  const type = S.trim.type;
+  return CURVE_X[type].map(x => {
+    const t = type === "count" ? { type, n: x } : { type, days: x };
+    let y = 0; for (const f of MODEL.files) y += reclaimFor(f, t)[0];
+    return { x, y };
+  });
+}
+function niceTicks(max){ // binary units so labels read as round GB/MB
+  const unit = Math.pow(1024, Math.max(0, Math.floor(Math.log(Math.max(max, 1)) / Math.log(1024))));
+  const m = max / unit;
+  let step = Math.pow(10, Math.floor(Math.log10(m / 4 || 1)));
+  for (const k of [1, 2, 2.5, 5, 10]) if (m / (step * k) <= 4){ step *= k; break; }
+  const out = []; for (let v = 0; v <= m + step * 0.999; v += step) out.push(v * unit);
+  return out.length > 1 ? out : [0, max || 1];
+}
+let CURVE = [];
+function drawCurve(){
+  const host = $("#wiChart"), W = host.clientWidth, H = host.clientHeight;
+  if (!W || !CURVE.length) return;
+  const m = { l: 62, r: 14, t: 10, b: 30 }, type = S.trim.type, xs = CURVE.map(p => p.x);
+  const ticks = niceTicks(Math.max(...CURVE.map(p => p.y), MODEL.reclaim.total)), yMax = ticks[ticks.length - 1] || 1;
+  const lx = Math.log(xs[0]), hx = Math.log(xs[xs.length - 1]);
+  const X = x => m.l + (Math.log(Math.min(Math.max(x, xs[0]), xs[xs.length - 1])) - lx) / (hx - lx) * (W - m.l - m.r);
+  const Y = y => m.t + (1 - y / yMax) * (H - m.t - m.b);
+  const xt = type === "count" ? [1, 5, 10, 25, 50, 100, 500] : [7, 30, 90, 365, 730, 1825];
+  const cur = type === "count" ? S.trim.n : S.trim.days;
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Reclaimable space for each trim setting">`;
+  for (const t of ticks) s += `<line x1="${m.l}" x2="${W - m.r}" y1="${Y(t)}" y2="${Y(t)}" stroke="var(--grid)" stroke-width="1"/><text class="tick" x="${m.l - 8}" y="${Y(t) + 4}" text-anchor="end">${fmtBytes(t)}</text>`;
+  s += `<line x1="${m.l}" x2="${W - m.r}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--axis)" stroke-width="1"/>`;
+  for (const t of xt) s += `<text class="tick" x="${X(t)}" y="${H - 10}" text-anchor="middle">${type === "count" ? t : shortDays(t)}</text>`;
+  s += `<text class="tick" x="${W - m.r}" y="${m.t + 12}" text-anchor="end">${type === "count" ? "versions kept →" : "versions older than →"}</text>`;
+  s += `<path d="${CURVE.map((p, i) => (i ? "L" : "M") + X(p.x).toFixed(1) + "," + Y(p.y).toFixed(1)).join("")}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round"/>`;
+  for (const p of CURVE) s += `<circle cx="${X(p.x)}" cy="${Y(p.y)}" r="4" fill="var(--surface-1)" stroke="var(--s1)" stroke-width="2"/>`;
+  s += `<line id="wiCross" x1="0" x2="0" y1="${m.t}" y2="${Y(0)}" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="3 3" visibility="hidden"/>`;
+  s += `<circle cx="${X(cur)}" cy="${Y(MODEL.reclaim.total)}" r="7" fill="var(--s1)" stroke="var(--surface-1)" stroke-width="2"/>`;
+  s += `<rect x="${m.l}" y="0" width="${W - m.l - m.r}" height="${H}" fill="transparent" style="cursor:pointer"/></svg>`;
+  host.innerHTML = s;
+  const svg = host.querySelector("svg"), cross = host.querySelector("#wiCross");
+  const nearest = e => {
+    const r = svg.getBoundingClientRect(), px = (e.clientX - r.left) * (W / r.width);
+    return CURVE.reduce((a, p) => Math.abs(X(p.x) - px) < Math.abs(X(a.x) - px) ? p : a);
+  };
+  svg.onmousemove = e => {
+    const p = nearest(e), label = type === "count" ? `Keep the latest ${p.x}` : `Delete versions older than ${fmtDays(p.x)}`;
+    cross.setAttribute("x1", X(p.x)); cross.setAttribute("x2", X(p.x)); cross.setAttribute("visibility", "visible");
+    const tip = $("#tip");
+    tip.innerHTML = `<div class="t">${label}</div><table><tr><td>Reclaimable</td><td>${fmtBytes(p.y)}</td></tr><tr><td>Share of version history</td><td>${fmtPct(p.y, MODEL.root.version)}</td></tr></table><div class="p" style="margin:6px 0 0">Click to use this setting</div>`;
+    tip.style.display = "block";
+    const tr = tip.getBoundingClientRect();
+    tip.style.left = Math.max(8, e.clientX + 14 + tr.width > innerWidth - 8 ? e.clientX - tr.width - 14 : e.clientX + 14) + "px";
+    tip.style.top = Math.max(8, e.clientY - tr.height - 10) + "px";
+  };
+  svg.onmouseleave = () => { cross.setAttribute("visibility", "hidden"); hideTip(); };
+  svg.onclick = e => { const p = nearest(e); if (type === "count") S.trim.n = p.x; else S.trim.days = p.x; onTrimChange(); };
+}
+function syncTrimControls(){
+  const type = S.trim.type, presets = type === "count" ? COUNT_PRESETS : AGE_PRESETS, v = type === "count" ? S.trim.n : S.trim.days;
+  document.querySelectorAll(".seg button").forEach(b => b.setAttribute("aria-checked", b.dataset.type === type));
+  const isPreset = presets.includes(v);
+  $("#wiPreset").innerHTML = presets.map(p => `<option value="${p}" ${p === v ? "selected" : ""}>${type === "count" ? p + " versions" : fmtDays(p)}</option>`).join("") +
+    `<option value="custom" ${isPreset ? "" : "selected"}>Custom…</option>`;
+  const ci = $("#wiCustom"); ci.hidden = isPreset; ci.value = v;
+  $("#wiUnit").textContent = isPreset ? "" : type === "count" ? "versions" : "days";
+}
+function renderWhatIf(){
+  if (!MODEL) return;
+  syncTrimControls();
+  const R = MODEL.reclaim, root = MODEL.root, approx = R.est ? "≈ " : "";
+  CURVE = curvePoints();
+  const exactPct = R.total ? Math.round(R.exact / R.total * 100) : 100;
+  $("#wiHero").innerHTML = `<div class="lab">Space you would get back if you ${esc(ruleLabel())}</div>
+    <div class="big">${approx}${fmtBytes(R.total)}</div>
+    <div class="sub">${fmtPct(R.total, root.version)} of version history &middot; ${fmtPct(R.total, root.total)} of ${MODEL.multi ? "total" : "site"} storage</div>
+    ${MODEL.ovSites.length ? `<div class="sub">Covers the ${fmtInt(MODEL.deepSites.length)} sites scanned in detail only.</div>` : ""}
+    <div class="sub">Storage used drops from ${fmtBytes(root.total)} to ${fmtBytes(root.total - R.total)}.</div>
+    <div class="sub">${fmtInt(R.files)} files lose ${fmtInt(R.removed)} old versions. No current file is touched.</div>
+    <div class="basis">${R.total ? `${exactPct}% of this figure comes from actual version sizes in the scan.${exactPct < 100 ? ` The other ${100 - exactPct}% is estimated by assuming a file's old versions are all the same size, which usually overstates it a little.` : ""}` : "Nothing to reclaim with this setting."}</div>`;
+  $("#wiChartTitle").textContent = S.trim.type === "count"
+    ? "Space you get back for each number of versions kept. Fewer versions kept, more space back. Click a point to choose it."
+    : "Space you get back for each age limit. Click a point to choose it.";
+  drawCurve();
+  // by library
+  const libs = root.children.filter(l => l.version > 0).sort((a, b) => b.reclaim - a.reclaim);
+  const maxL = Math.max(1, ...libs.map(l => l.reclaim));
+  const hasSites = libs.some(l => l.kind === "site"), hasLibs = libs.some(l => l.kind === "library");
+  const byLabel = hasSites && hasLibs ? "Library or subsite" : hasSites ? "Site" : "Library";
+  $("#wiByTitle").textContent = "By " + byLabel.toLowerCase();
+  $("#wiLibs").innerHTML = `<div class="tbl-wrap"><table class="data"><thead><tr><th>${byLabel}</th><th class="num">Reclaimable</th><th class="num">Of its history</th></tr></thead><tbody>${
+    libs.map(l => `<tr><td><div class="nm">${esc(l.name)}</div><div class="bar" style="width:${(l.reclaim / maxL * 100).toFixed(1)}%;background:var(--s1)"></div></td><td class="num">${fmtBytes(l.reclaim)}</td><td class="num">${fmtPct(l.reclaim, l.version)}</td></tr>`).join("")
+  }</tbody></table></div>`;
+  // top files
+  const top = MODEL.files.filter(f => f.reclaim > 0).sort((a, b) => b.reclaim - a.reclaim).slice(0, 10);
+  $("#wiFiles").innerHTML = top.length ? `<div class="tbl-wrap"><table class="data"><thead><tr><th>File</th><th class="num">Old versions removed</th><th class="num">Reclaimable</th><th>Basis</th></tr></thead><tbody>${
+    top.map(f => `<tr><td>${nameCell(f)}</td><td class="num">${fmtInt(f.removed)} of ${fmtInt(f.histCount)}</td><td class="num">${fmtBytes(f.reclaim)}</td><td>${f.hist ? "Exact" : "Estimate"}</td></tr>`).join("")
+  }</tbody></table></div>` : `<div class="more">No file loses any versions with this setting.</div>`;
+}
+function onTrimChange(){
+  hideTip();
+  computeReclaim();
+  renderKpis(); renderWhatIf(); renderView("bloat");
+  if (S.tab === "tree") renderTreemap();
+}
+document.querySelectorAll(".seg button").forEach(b => b.onclick = () => { S.trim.type = b.dataset.type; onTrimChange(); });
+$("#wiPreset").onchange = e => {
+  if (e.target.value === "custom"){ const ci = $("#wiCustom"); ci.hidden = false; $("#wiUnit").textContent = S.trim.type === "count" ? "versions" : "days"; ci.focus(); ci.select(); return; }
+  if (S.trim.type === "count") S.trim.n = +e.target.value; else S.trim.days = +e.target.value;
+  onTrimChange();
+};
+$("#wiCustom").onchange = e => {
+  const v = Math.max(1, Math.round(+e.target.value || 1));
+  if (S.trim.type === "count") S.trim.n = v; else S.trim.days = v;
+  onTrimChange();
+};
+{ let rq; new ResizeObserver(() => { cancelAnimationFrame(rq); rq = requestAnimationFrame(() => MODEL && S.tab === "bloat" && drawCurve()); }).observe($("#wiChart")); }
+
+/* ---------------- layout: snap presets + draggable divider ---------------- */
+// split = treemap's share of the width (%). flip = contents panel on the left.
+const LAYOUT = { mode: "split", split: 50, flip: false };
+const SNAPS = [
+  { title: "Treemap | Contents", items: [{ split: 70, flip: false }, { split: 50, flip: false }, { split: 30, flip: false }] },
+  { title: "Contents | Treemap", items: [{ split: 70, flip: true }, { split: 50, flip: true }, { split: 30, flip: true }] },
+  { title: "Stacked or one view", items: [{ mode: "stack" }, { mode: "tree" }, { mode: "list" }] }
+];
+const MODE_LABEL = { stack: "Top / bottom", tree: "Treemap only", list: "Contents only" };
+function applyLayout(save){
+  const el = $(".tm-layout"), p = Math.round(LAYOUT.split);
+  if (!["split","stack","tree","list"].includes(LAYOUT.mode)) LAYOUT.mode = "split";
+  ["split","stack","tree","list"].forEach(m => el.classList.toggle(m, LAYOUT.mode === m));
+  if (LAYOUT.mode === "list") setHL(null, false);
+  el.classList.toggle("flip", LAYOUT.flip);
+  const tm = `minmax(0,${p}fr)`, ct = `minmax(0,${100 - p}fr)`;
+  el.style.setProperty("--c1", LAYOUT.flip ? ct : tm);
+  el.style.setProperty("--c2", LAYOUT.flip ? tm : ct);
+  const g = $("#gutter");
+  g.setAttribute("aria-valuenow", p); g.setAttribute("aria-valuemin", 20); g.setAttribute("aria-valuemax", 80);
+  g.setAttribute("aria-valuetext", `Treemap ${p}%, contents ${100 - p}%`);
+  renderSnap();
+  if (save) try { localStorage.setItem("spst-layout", JSON.stringify(LAYOUT)); } catch {}
+}
+const clampSplit = v => Math.min(80, Math.max(20, v));
+function mini(o){
+  if (o.mode === "stack") return `<div class="mini col"><div class="m-tm" style="flex:62"></div><div class="m-ct" style="flex:38"></div></div>`;
+  if (o.mode === "tree") return `<div class="mini"><div class="m-tm" style="flex:1"></div></div>`;
+  if (o.mode === "list") return `<div class="mini"><div class="m-ct" style="flex:1"></div></div>`;
+  const tm = `<div class="m-tm" style="flex:${o.split}"></div>`, ct = `<div class="m-ct" style="flex:${100 - o.split}"></div>`;
+  return `<div class="mini">${o.flip ? ct + tm : tm + ct}</div>`;
+}
+function renderSnap(){
+  const isOn = o => o.mode ? LAYOUT.mode === o.mode
+    : LAYOUT.mode === "split" && LAYOUT.flip === o.flip && Math.round(LAYOUT.split) === o.split;
+  $("#snap").innerHTML = SNAPS.map((g, gi) => `<div class="snap-title">${g.title}</div><div class="snap-row">${g.items.map((o, i) => {
+    const label = o.mode ? MODE_LABEL[o.mode] : o.flip ? `${100 - o.split} / ${o.split}` : `${o.split} / ${100 - o.split}`;
+    return `<button class="snap-opt" role="menuitemradio" aria-checked="${isOn(o)}" data-g="${gi}" data-i="${i}" aria-label="${g.title} ${label}">${mini(o)}<span>${label}</span></button>`;
+  }).join("")}</div>`).join("") + `<div class="snap-hint">You can also drag the divider. Double-click it to go back to 50 / 50.</div>`;
+  $("#snap").querySelectorAll(".snap-opt").forEach(b => b.onclick = () => {
+    const o = SNAPS[+b.dataset.g].items[+b.dataset.i];
+    if (o.mode) LAYOUT.mode = o.mode;
+    else Object.assign(LAYOUT, { mode: "split", split: o.split, flip: o.flip });
+    applyLayout(true); toggleSnap(false);
+  });
+}
+function toggleSnap(open){
+  $("#snap").hidden = !open;
+  $("#btnLayout").setAttribute("aria-expanded", open);
+  if (open) $("#snap").querySelector('[aria-checked="true"]')?.focus();
+}
+$("#btnLayout").onclick = e => { e.stopPropagation(); toggleSnap($("#snap").hidden); };
+document.addEventListener("click", e => { if (!e.target.closest(".layout-pick")) toggleSnap(false); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#snap").hidden){ toggleSnap(false); $("#btnLayout").focus(); } });
+(function wireGutter(){
+  const g = $("#gutter");
+  g.addEventListener("pointerdown", e => {
+    e.preventDefault(); g.setPointerCapture(e.pointerId); g.classList.add("drag"); hideTip();
+    const move = ev => {
+      const r = $(".tm-layout").getBoundingClientRect(), x = (ev.clientX - r.left) / r.width * 100;
+      LAYOUT.split = clampSplit(LAYOUT.flip ? 100 - x : x);
+      applyLayout(false);
+    };
+    const up = () => { g.classList.remove("drag"); g.removeEventListener("pointermove", move); g.removeEventListener("pointerup", up); applyLayout(true); };
+    g.addEventListener("pointermove", move); g.addEventListener("pointerup", up);
+  });
+  g.addEventListener("dblclick", () => { LAYOUT.split = 50; applyLayout(true); });
+  g.addEventListener("keydown", e => {
+    const step = e.shiftKey ? 10 : 5, dir = e.key === "ArrowLeft" ? -1 : e.key === "ArrowRight" ? 1 : 0;
+    if (dir){ e.preventDefault(); LAYOUT.split = clampSplit(LAYOUT.split + (LAYOUT.flip ? -dir : dir) * step); applyLayout(true); }
+    if (e.key === "Home" || e.key === "Enter"){ e.preventDefault(); LAYOUT.split = 50; applyLayout(true); }
+  });
+})();
+try { Object.assign(LAYOUT, JSON.parse(localStorage.getItem("spst-layout") || "{}")); } catch {}
+{ // deep link for testing/sharing: #split=30&flip=1&view=split|stack|tree|list&snap=1
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.has("split")){ LAYOUT.split = clampSplit(+h.get("split") || 50); LAYOUT.mode = "split"; }
+  if (h.has("flip")) LAYOUT.flip = h.get("flip") === "1";
+  if (h.has("view")) LAYOUT.mode = h.get("view");
+  LAYOUT.split = clampSplit(+LAYOUT.split || 50);
+  applyLayout(false);
+  if (h.get("snap") === "1") toggleSnap(true);
+}
+
+/* ---------------- start ---------------- */
+// Served over http next to a report.json? use it. Opened from disk (file://)? fall back to sample.
+// Show-SPStorageTree / Get-SPStorageTree -Open embed the report(s) as window.SPST_REPORT.
+(async () => {
+  if (window.SPST_REPORT){ load(window.SPST_REPORT, false); openHashTab(); return; }
+  if (location.protocol.startsWith("http")){
+    try { const r = await fetch("report.json", { cache: "no-store" }); if (r.ok){ load(await r.json(), false); openHashTab(); return; } } catch {}
+  }
+  const sk = (/sample=(\w+)/.exec(location.hash) || [])[1];
+  const kind = SAMPLE_TEXT[sk] ? sk : "site";
+  load(makeSample(kind), kind);
+  openHashTab();
+})();
+// deep link: storagetree.html#tab=bloat
+function openHashTab(){
+  const m = /tab=(\w+)/.exec(location.hash);
+  const t = m && document.querySelector(`.tab[data-tab="${m[1]}"]`);
+  const sz = /size=(\w+)/.exec(location.hash);
+  if (sz && $(`#optSize option[value="${sz[1]}"]`)){ $("#optSize").value = sz[1]; S.sizeBy = sz[1]; if (S.tab === "tree") renderTreemap(); }
+  if (t) t.click();
+}
+</script>
+</body>
+</html>

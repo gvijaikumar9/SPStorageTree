@@ -1,0 +1,10 @@
+# Private working notes (lab tenant details, personal notes): local only.
+SCOPE.md
+# Scan output contains tenant file names, sizes and people's names: never commit it.
+report*.json
+report*.html
+*.report.json
+scan-*.json
+# build output (copied from /viewer and /LICENSE by build.ps1)
+module/SPStorageTree/viewer/
+module/SPStorageTree/LICENSE
